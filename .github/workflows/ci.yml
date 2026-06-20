@@ -31,7 +31,7 @@ jobs:
           path: .venv
           key: venv-${{ matrix.python-version }}-${{ hashFiles('poetry.lock') }}
       - run: poetry config virtualenvs.in-project true && poetry install
-      - run: poetry run pytest -m "not integration and not rpi" --cov=bugcam
+      - run: poetry run pytest -m "not integration and not rpi"
       - run: poetry run python -m compileall bugcam/
 
   package:
