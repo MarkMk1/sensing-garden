@@ -82,7 +82,9 @@ class TestTick:
         assert not path.exists()
         assert pol.store.get(rid) is None
 
-    def test_retain_keeps_file_but_prunes_row(self, tmp_path):
+    def test_retain_keeps_file_as_tombstone(self, tmp_path):
+        from bugcam.pollen.store import UploadStatus
+
         cfg = _config(tmp_path)
         pol = _pollen(cfg)
         path = _write(cfg.output_root, "dot1/20260204/results.json", b'{"tracks":[{"track_id":"t"}]}')
@@ -91,7 +93,11 @@ class TestTick:
         pol._tick()
 
         assert path.exists()  # DOT day-bucket retained
-        assert pol.store.get(rid) is None
+        # row kept as a 'done' tombstone so a re-scan of the same content is deduped
+        assert pol.store.get(rid).status == UploadStatus.DONE
+        # an unchanged re-enqueue is ignored; the queue stays empty
+        assert pol.enqueue(path, "result", metadata={"retain": True}) is None
+        assert pol.store.pending_count() == 0
 
     def test_failed_upload_leaves_row_pending(self, tmp_path):
         cfg = _config(tmp_path)

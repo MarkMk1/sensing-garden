@@ -23,7 +23,8 @@ from typing import Any, Optional
 class UploadStatus(str, Enum):
     PENDING = "pending"
     UPLOADING = "uploading"
-    UPLOADED = "uploaded"
+    UPLOADED = "uploaded"      # shipped, awaiting cleanup
+    DONE = "done"              # shipped + file retained; a dedup tombstone
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,7 @@ class UploadRow:
     parts: list[dict[str, Any]]
     size: Optional[int]
     attempts: int
+    fingerprint: Optional[str] = None
 
 
 _SCHEMA = """
@@ -52,6 +54,7 @@ CREATE TABLE IF NOT EXISTS uploads (
     parts       TEXT NOT NULL DEFAULT '[]',
     size        INTEGER,
     attempts    INTEGER NOT NULL DEFAULT 0,
+    fingerprint TEXT,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -84,21 +87,40 @@ class PollenStore:
         s3_key: str,
         metadata: Optional[dict[str, Any]] = None,
         size: Optional[int] = None,
+        fingerprint: Optional[str] = None,
     ) -> Optional[int]:
-        """Queue an artifact. Returns the new row id, or None if already queued."""
+        """Queue an artifact, or re-activate one whose content changed.
+
+        Returns the row id, or None when an identical artifact (same s3_key and
+        fingerprint) is already queued or shipped. A row that exists with a
+        *different* fingerprint (e.g. a grown DOT results.json) is reset to
+        pending so the new content re-uploads.
+        """
         now = _now()
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "INSERT INTO uploads (local_path, kind, s3_key, status, metadata, size, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO uploads (local_path, kind, s3_key, status, metadata, size, fingerprint, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (local_path, kind, s3_key, UploadStatus.PENDING.value,
-                     json.dumps(metadata or {}), size, now, now),
+                     json.dumps(metadata or {}), size, fingerprint, now, now),
                 )
                 self._conn.commit()
                 return int(cur.lastrowid)
             except sqlite3.IntegrityError:
-                return None  # s3_key already queued
+                existing = self._conn.execute(
+                    "SELECT id, fingerprint FROM uploads WHERE s3_key = ?", (s3_key,)
+                ).fetchone()
+                if existing is None or existing["fingerprint"] == fingerprint:
+                    return None
+                self._conn.execute(
+                    "UPDATE uploads SET status = ?, fingerprint = ?, local_path = ?, metadata = ?, "
+                    "size = ?, upload_id = NULL, parts = '[]', updated_at = ? WHERE id = ?",
+                    (UploadStatus.PENDING.value, fingerprint, local_path,
+                     json.dumps(metadata or {}), size, now, existing["id"]),
+                )
+                self._conn.commit()
+                return int(existing["id"])
 
     def mark_uploading(self, row_id: int, upload_id: Optional[str] = None) -> None:
         self._update(row_id, status=UploadStatus.UPLOADING.value, upload_id=upload_id)
@@ -126,6 +148,10 @@ class PollenStore:
     def mark_uploaded(self, row_id: int) -> None:
         self._update(row_id, status=UploadStatus.UPLOADED.value)
 
+    def mark_done(self, row_id: int) -> None:
+        """Retain the file but keep the row as a dedup tombstone."""
+        self._update(row_id, status=UploadStatus.DONE.value)
+
     def delete(self, row_id: int) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM uploads WHERE id = ?", (row_id,))
@@ -139,13 +165,27 @@ class PollenStore:
             return _to_row(row) if row else None
 
     def claim_pending(self, limit: Optional[int] = None) -> list[UploadRow]:
-        sql = "SELECT * FROM uploads WHERE status != ? ORDER BY id"
-        params: list[Any] = [UploadStatus.UPLOADED.value]
+        sql = "SELECT * FROM uploads WHERE status IN (?, ?) ORDER BY id"
+        params: list[Any] = [UploadStatus.PENDING.value, UploadStatus.UPLOADING.value]
         if limit is not None:
             sql += " LIMIT ?"
             params.append(limit)
         with self._lock:
             return [_to_row(r) for r in self._conn.execute(sql, params).fetchall()]
+
+    def prune_missing(self) -> int:
+        """Drop shipped rows (uploaded or done tombstones) whose file is gone."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, local_path FROM uploads WHERE status IN (?, ?)",
+                (UploadStatus.UPLOADED.value, UploadStatus.DONE.value),
+            ).fetchall()
+            gone = [r["id"] for r in rows if not Path(r["local_path"]).exists()]
+            for row_id in gone:
+                self._conn.execute("DELETE FROM uploads WHERE id = ?", (row_id,))
+            if gone:
+                self._conn.commit()
+            return len(gone)
 
     def uploaded_rows(self) -> list[UploadRow]:
         with self._lock:
@@ -162,7 +202,8 @@ class PollenStore:
     def pending_count(self) -> int:
         with self._lock:
             cur = self._conn.execute(
-                "SELECT COUNT(*) FROM uploads WHERE status != ?", (UploadStatus.UPLOADED.value,)
+                "SELECT COUNT(*) FROM uploads WHERE status IN (?, ?)",
+                (UploadStatus.PENDING.value, UploadStatus.UPLOADING.value),
             )
             return int(cur.fetchone()[0])
 
@@ -199,4 +240,5 @@ def _to_row(row: sqlite3.Row) -> UploadRow:
         parts=json.loads(row["parts"]),
         size=row["size"],
         attempts=row["attempts"],
+        fingerprint=row["fingerprint"],
     )

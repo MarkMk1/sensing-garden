@@ -28,6 +28,15 @@ logger = logging.getLogger("bugcam.pollen")
 ARCHIVE_KIND = "archive"
 
 
+def _fingerprint(path: Path) -> Optional[str]:
+    """Cheap content signature: size + mtime. Grows/changes when the file does."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return f"{stat.st_size}:{int(stat.st_mtime)}"
+
+
 @dataclass
 class PollenConfig:
     db_path: Path
@@ -49,6 +58,7 @@ class Pollen:
         archiver: Optional[Archiver] = None,
         store: Optional[PollenStore] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        enqueue_source: Optional[Callable[["Pollen"], None]] = None,
     ) -> None:
         self.config = config
         self.store = store or PollenStore(config.db_path)
@@ -57,6 +67,7 @@ class Pollen:
         )
         self.archiver = archiver
         self._clock = clock or datetime.now
+        self._source = enqueue_source  # called each tick to enqueue ready outputs
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -71,7 +82,10 @@ class Pollen:
             return None
         s3_key = self._derive_key(path)
         size = path.stat().st_size if path.exists() else None
-        return self.store.enqueue(str(path), kind=kind, s3_key=s3_key, metadata=metadata, size=size)
+        return self.store.enqueue(
+            str(path), kind=kind, s3_key=s3_key, metadata=metadata, size=size,
+            fingerprint=_fingerprint(path),
+        )
 
     def _derive_key(self, path: Path) -> str:
         root = self.config.output_root.resolve()
@@ -113,6 +127,11 @@ class Pollen:
     # the work
     # ------------------------------------------------------------------ #
     def _tick(self) -> None:
+        if self._source is not None:
+            try:
+                self._source(self)  # enqueue any ready outputs (results, logs, ...)
+            except Exception:
+                logger.exception("pollen enqueue source failed")
         pending = self.store.claim_pending()
         if self.config.batch and self.archiver is not None:
             self._upload_batched(pending)
@@ -168,4 +187,8 @@ class Pollen:
         for row in self.store.uploaded_rows():
             if kinds.for_kind(row.kind).delete_after_upload(row.metadata):
                 Path(row.local_path).unlink(missing_ok=True)
-            self.store.delete(row.id)
+                self.store.delete(row.id)
+            else:
+                # Retained file (DOT bucket, log): keep a tombstone so a re-scan
+                # of the same content is deduped, but new content re-uploads.
+                self.store.mark_done(row.id)

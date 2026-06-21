@@ -14,6 +14,7 @@ from rich.console import Console
 from bugcam.commands.heartbeat import write_heartbeat_snapshot
 from bugcam.commands.upload import upload_ready_results, watch_uploads
 from bugcam.pollen.integration import build_pollen
+from bugcam.pollen.producers import enqueue_ready_outputs
 from bugcam.config import (
     DEFAULT_API_URL,
     DEFAULT_S3_BUCKET,
@@ -267,9 +268,15 @@ def run(
         pollen_instance = None
         if pollen_enabled:
             pollen_instance = build_pollen(
-                output_dir, settings["api_url"], settings["api_key"], poll_interval=upload_poll
+                output_dir,
+                settings["api_url"],
+                settings["api_key"],
+                poll_interval=upload_poll,
+                enqueue_source=lambda p: enqueue_ready_outputs(
+                    p, output_dir, settings["flick_id"], settings["dot_ids"]
+                ),
             )
-            console.print("[dim]Pollen[/dim] owns telemetry uploads")
+            console.print("[dim]Pollen[/dim] owns telemetry, results, and logs")
         selected_model = select_model_reference(model)
         provenance = resolve_bundle_provenance(selected_model)
         if model is None:

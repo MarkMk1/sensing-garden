@@ -6,6 +6,7 @@ of the app entrypoint so producers just call ``pollen.enqueue(...)``.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable, Optional
 
 from bugcam.config import get_state_dir
 from bugcam.pollen.archive import TarArchiver
@@ -21,6 +22,7 @@ def build_pollen(
     batch: bool = False,
     poll_interval: float = 10.0,
     state_dir: Path | None = None,
+    enqueue_source: Optional[Callable[[Pollen], None]] = None,
 ) -> Pollen:
     """Construct a Pollen owning uploads out of ``output_dir``."""
     base = (state_dir or get_state_dir()) / "pollen"
@@ -33,4 +35,4 @@ def build_pollen(
     )
     presigner = Presigner(api_url, api_key)
     archiver = TarArchiver() if batch else None
-    return Pollen(config, presigner=presigner, archiver=archiver)
+    return Pollen(config, presigner=presigner, archiver=archiver, enqueue_source=enqueue_source)
