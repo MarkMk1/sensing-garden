@@ -10,6 +10,7 @@ empty while still accepting new enqueues; ``stop()`` halts the loop.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 from collections import defaultdict
@@ -30,13 +31,27 @@ ARCHIVE_KIND = "archive"
 MAX_RETRY_DELAY_SECONDS = 300  # matches the legacy upload loop
 
 
+# Hash used for the change-detection fingerprint. A single knob so it is a
+# one-line swap. md5 is fine for these small files, but the choice is a deliberate
+# FUTURE-DISCUSSION item: if profiling shows the per-scan re-hash of retained
+# files matters, switch to a cheaper non-cryptographic hash (e.g. blake2b which is
+# already in hashlib, or xxhash) -- collision-resistance is not required here,
+# only change detection.
+FINGERPRINT_HASH = "md5"
+
+
 def _fingerprint(path: Path) -> Optional[str]:
-    """Cheap content signature: size + mtime. Grows/changes when the file does."""
+    """Content signature so any change to the bytes re-uploads, regardless of
+    size/mtime. The files this runs on (results.json, crops, logs) are small; the
+    large hourly tar is enqueued without going through here."""
     try:
-        stat = path.stat()
+        digest = hashlib.new(FINGERPRINT_HASH)
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
     except OSError:
         return None
-    return f"{stat.st_size}:{int(stat.st_mtime)}"
 
 
 @dataclass

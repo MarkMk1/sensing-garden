@@ -68,6 +68,24 @@ class TestEnqueue:
         assert pol.enqueue(log, "log") is None
 
 
+class TestFingerprint:
+    def test_content_change_reuploads_even_with_preserved_mtime(self, tmp_path):
+        import os
+
+        cfg = _config(tmp_path)
+        pol = _pollen(cfg)
+        path = _write(cfg.output_root, "dot1/20260204/results.json", b'{"tracks":[{"track_id":"t"}]}')
+        rid = pol.enqueue(path, "result", metadata={"retain": True})
+        assert pol.enqueue(path, "result", metadata={"retain": True}) is None  # unchanged -> dedup
+
+        # Same byte length AND same mtime, different content -> only a content hash
+        # catches this (the old size:mtime fingerprint would have missed it).
+        st = path.stat()
+        path.write_bytes(b'{"tracks":[{"track_id":"X"}]}')
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert pol.enqueue(path, "result", metadata={"retain": True}) == rid  # reactivated
+
+
 class TestTick:
     def test_uploads_then_deletes_and_prunes(self, tmp_path):
         cfg = _config(tmp_path)
