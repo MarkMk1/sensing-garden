@@ -88,6 +88,33 @@ class TestResults:
         assert any(r.s3_key.endswith("results.json") for r in pol.store.claim_pending())
 
 
+class TestEmptyDirSweep:
+    def test_emptied_flik_dir_is_swept(self, tmp_path):
+        pol, out = _pollen(tmp_path)
+        rd = _result_dir(out, "flick1", "20260204_120000", done=True)
+        enqueue_ready_outputs(pol, out, "flick1", [])
+        pol._tick()  # uploads + deletes the FLIK files, leaving an empty shell
+
+        enqueue_ready_outputs(pol, out, "flick1", [])  # next scan sweeps it
+        assert not rd.exists()
+
+    def test_telemetry_dirs_not_swept_when_empty(self, tmp_path):
+        pol, out = _pollen(tmp_path)
+        (out / "flick1" / "heartbeats").mkdir(parents=True)
+        (out / "flick1" / "logs").mkdir(parents=True)
+        enqueue_ready_outputs(pol, out, "flick1", [])
+        assert (out / "flick1" / "heartbeats").exists()
+        assert (out / "flick1" / "logs").exists()
+
+    def test_retained_dot_dir_not_swept(self, tmp_path):
+        pol, out = _pollen(tmp_path)
+        rd = _result_dir(out, "dot1", "20260204")
+        enqueue_ready_outputs(pol, out, "flick1", ["dot1"])
+        pol._tick()  # DOT files retained -> dir still has files
+        enqueue_ready_outputs(pol, out, "flick1", ["dot1"])
+        assert rd.exists()
+
+
 class TestLogs:
     def test_completed_log_enqueued_today_skipped(self, tmp_path):
         pol, out = _pollen(tmp_path)

@@ -19,6 +19,7 @@ SIDECARS = {
     ".done", ".detection.json", ".expected_tracks", ".completed_tracks",
     ".uploaded", ".archived", ".archived-aux",
 }
+AUX_DIR_NAMES = {"heartbeats", "environment", "logs"}
 
 
 def enqueue_ready_outputs(pollen, output_dir, flick_id: str, dot_ids: list[str], *, today: str | None = None) -> int:
@@ -27,10 +28,25 @@ def enqueue_ready_outputs(pollen, output_dir, flick_id: str, dot_ids: list[str],
     if not output_dir.exists():
         return 0
     pollen.store.prune_missing()  # bound tombstones whose files are gone
-    return (
+    enqueued = (
         _enqueue_results(pollen, output_dir, flick_id, dot_ids)
         + _enqueue_logs(pollen, output_dir, today=today)
     )
+    _sweep_empty_result_dirs(output_dir, flick_id, dot_ids)
+    return enqueued
+
+
+def _sweep_empty_result_dirs(output_dir: Path, flick_id: str, dot_ids: list[str]) -> None:
+    """Remove result-unit dirs left empty after their files were uploaded + deleted."""
+    for device in {flick_id, *dot_ids}:
+        device_dir = output_dir / device
+        if not device_dir.is_dir():
+            continue
+        for child in list(device_dir.iterdir()):
+            if child.is_dir() and child.name not in AUX_DIR_NAMES:
+                # Sweepable once nothing but sidecars (e.g. a leftover .done) remains.
+                if not any(p.is_file() and p.name not in SIDECARS for p in child.rglob("*")):
+                    shutil.rmtree(child, ignore_errors=True)
 
 
 def _enqueue_results(pollen, output_dir: Path, flick_id: str, dot_ids: list[str]) -> int:
