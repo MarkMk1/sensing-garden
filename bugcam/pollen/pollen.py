@@ -15,7 +15,7 @@ import logging
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -29,6 +29,7 @@ logger = logging.getLogger("bugcam.pollen")
 
 ARCHIVE_KIND = "archive"
 MAX_RETRY_DELAY_SECONDS = 300  # matches the legacy upload loop
+STUCK_WARN_SECONDS = 3600      # warn loudly once the oldest item has waited this long
 
 
 # Hash used for the change-detection fingerprint. A single knob so it is a
@@ -130,6 +131,30 @@ class Pollen:
             self._thread.join(timeout=timeout)
             self._thread = None
 
+    def upload_stats(self, now: Optional[datetime] = None) -> dict:
+        """Queue health for observability: how many are pending, how long the
+        oldest has waited, and the worst attempt count."""
+        summary = self.store.pending_summary()
+        oldest_age = None
+        if summary["oldest_created_at"]:
+            oldest = datetime.fromisoformat(summary["oldest_created_at"])
+            oldest_age = ((now or datetime.now(timezone.utc)) - oldest).total_seconds()
+        return {
+            "pending": summary["pending"],
+            "oldest_age_seconds": oldest_age,
+            "max_attempts": summary["max_attempts"],
+        }
+
+    def _warn_if_stuck(self) -> None:
+        stats = self.upload_stats()
+        age = stats["oldest_age_seconds"]
+        if age is not None and age >= STUCK_WARN_SECONDS:
+            logger.error(
+                "pollen: %d upload(s) stuck — oldest pending %.0fs over %d attempts; "
+                "data is retained but not reaching S3",
+                stats["pending"], age, stats["max_attempts"],
+            )
+
     def flush(self) -> None:
         """Drain the queue, still accepting enqueues. Returns when empty or when a
         tick makes no progress (uploads failing) so it never spins forever."""
@@ -165,6 +190,7 @@ class Pollen:
                 consecutive_failures += 1
                 delay = min(self.config.poll_interval * (2 ** consecutive_failures), MAX_RETRY_DELAY_SECONDS)
                 logger.warning("pollen: %d upload(s) failed; backing off %ss", tick_failures, delay)
+                self._warn_if_stuck()
                 self._stop.wait(delay)
             else:
                 consecutive_failures = 0

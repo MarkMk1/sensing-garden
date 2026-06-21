@@ -216,6 +216,16 @@ class PollenStore:
             )
             return int(cur.fetchone()[0])
 
+    def pending_summary(self) -> dict[str, Any]:
+        """Backlog health: how many are queued, the oldest one's enqueue time, and
+        the worst attempt count -- so a failing-but-retaining device is visible."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*), MIN(created_at), MAX(attempts) FROM uploads WHERE status IN (?, ?)",
+                (UploadStatus.PENDING.value, UploadStatus.UPLOADING.value),
+            ).fetchone()
+        return {"pending": int(row[0]), "oldest_created_at": row[1], "max_attempts": int(row[2] or 0)}
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
