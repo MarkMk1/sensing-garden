@@ -14,7 +14,7 @@ from rich.console import Console
 from bugcam.commands.heartbeat import write_heartbeat_snapshot
 from bugcam.commands.upload import upload_ready_results, watch_uploads
 from bugcam.pollen.integration import build_pollen
-from bugcam.pollen.producers import enqueue_ready_outputs
+from bugcam.pollen.producers import enqueue_ready_outputs, enqueue_result_dir
 from bugcam.config import (
     DEFAULT_API_URL,
     DEFAULT_S3_BUCKET,
@@ -284,6 +284,11 @@ def run(
         console.print(f"[cyan]Running[/cyan] flick={settings['flick_id']} dots={settings['dot_ids'] or '[]'}")
         console.print(f"[dim]Model[/dim] {provenance['model_id']}")
 
+        on_result_ready = None
+        if pollen_instance is not None:
+            on_result_ready = lambda d: enqueue_result_dir(  # noqa: E731 - small adapter
+                pollen_instance, d, settings["flick_id"], settings["dot_ids"]
+            )
         pipeline = build_pipeline(
             flick_id=settings["flick_id"],
             dot_ids=settings["dot_ids"],
@@ -295,6 +300,7 @@ def run(
             chunk_duration=chunk_duration,
             resolution=parsed_resolution,
             detection_config_path=detection_config,
+            on_result_ready=on_result_ready,
         )
         upload_stop_event = threading.Event()
         heartbeat_stop_event = threading.Event()

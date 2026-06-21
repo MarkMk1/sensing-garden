@@ -49,25 +49,37 @@ def _sweep_empty_result_dirs(output_dir: Path, flick_id: str, dot_ids: list[str]
                     shutil.rmtree(child, ignore_errors=True)
 
 
+def enqueue_result_dir(pollen, results_dir, flick_id: str, dot_ids: list[str]) -> int:
+    """Enqueue one finalized result dir's files. Used by the scanner and by the
+    pipeline's produce-site hook when a chunk is finalized."""
+    results_dir = Path(results_dir)
+    results_json = results_dir / RESULTS_FILENAME
+    if not results_json.exists():
+        return 0
+    device = results_dir.parent.name
+    is_flik = device == flick_id
+    is_dot = device in dot_ids
+    if not (is_flik or is_dot):
+        return 0
+    if _result_is_empty(results_json):
+        if is_flik:
+            shutil.rmtree(results_dir, ignore_errors=True)  # nothing detected: junk
+        return 0
+    count = 0
+    for path in sorted(results_dir.rglob("*")):
+        if path.is_file() and path.name not in SIDECARS:
+            if pollen.enqueue(path, "result", metadata={"retain": is_dot}) is not None:
+                count += 1
+    return count
+
+
 def _enqueue_results(pollen, output_dir: Path, flick_id: str, dot_ids: list[str]) -> int:
     count = 0
     for results_json in sorted(output_dir.rglob(RESULTS_FILENAME)):
         results_dir = results_json.parent
-        device = results_dir.parent.name
-        is_flik = device == flick_id
-        is_dot = device in dot_ids
-        if not (is_flik or is_dot):
-            continue
-        if is_flik and not (results_dir / DONE_MARKER).exists():
+        if results_dir.parent.name == flick_id and not (results_dir / DONE_MARKER).exists():
             continue  # FLIK chunk not finalized yet
-        if _result_is_empty(results_json):
-            if is_flik:
-                shutil.rmtree(results_dir, ignore_errors=True)  # nothing detected: junk
-            continue
-        for path in sorted(results_dir.rglob("*")):
-            if path.is_file() and path.name not in SIDECARS:
-                if pollen.enqueue(path, "result", metadata={"retain": is_dot}) is not None:
-                    count += 1
+        count += enqueue_result_dir(pollen, results_dir, flick_id, dot_ids)
     return count
 
 
