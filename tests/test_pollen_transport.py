@@ -106,6 +106,25 @@ class TestMultipart:
         assert [p["part_number"] for p in completed_parts] == [1, 2, 3]
         assert completed_parts[0]["etag"] == '"etag-old"'  # kept the original part 1
 
+    def test_resume_persists_no_urls_only_upload_id_and_etags(self, tmp_path):
+        # Presigned part URLs are minted fresh each attempt and never stored, so a
+        # multi-day gap before resuming is fine for the URLs -- only the multipart
+        # upload_id + part etags are persisted (and S3 keeps the upload until aborted).
+        import json
+        store = PollenStore(tmp_path / "p.db")
+        presigner, session = FakePresigner(), FakeSession()
+        up = Uploader(presigner, store, multipart_threshold=0, part_size=5, session=session)
+        row = _row(store, tmp_path, "big.tar", "archive", b"ABCDEFGHIJKL")
+        # interrupt after part 1
+        store.mark_uploading(row.id, upload_id="UP-PREV")
+        store.record_part(row.id, 1, '"etag-1"')
+
+        persisted = store.get(row.id)
+        blob = json.dumps({"upload_id": persisted.upload_id, "parts": persisted.parts})
+        assert "http" not in blob  # no presigned URLs persisted anywhere
+        assert persisted.upload_id == "UP-PREV"
+        assert all(set(p.keys()) == {"part_number", "etag"} for p in persisted.parts)
+
     def test_empty_file_is_single_shot(self, tmp_path):
         store = PollenStore(tmp_path / "p.db")
         presigner, session = FakePresigner(), FakeSession()

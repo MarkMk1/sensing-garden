@@ -20,12 +20,14 @@ from typing import Any, Callable, Optional
 
 from bugcam.pollen import kinds
 from bugcam.pollen.archive import Archiver
+from bugcam.pollen.presign import RateLimitError
 from bugcam.pollen.store import PollenStore, UploadRow
-from bugcam.pollen.transport import DEFAULT_MULTIPART_THRESHOLD, Uploader
+from bugcam.pollen.transport import DEFAULT_MULTIPART_THRESHOLD, DEFAULT_PART_SIZE, Uploader
 
 logger = logging.getLogger("bugcam.pollen")
 
 ARCHIVE_KIND = "archive"
+MAX_RETRY_DELAY_SECONDS = 300  # matches the legacy upload loop
 
 
 def _fingerprint(path: Path) -> Optional[str]:
@@ -45,6 +47,7 @@ class PollenConfig:
     key_prefix: str = "v1"
     poll_interval: float = 10.0
     multipart_threshold: int = DEFAULT_MULTIPART_THRESHOLD
+    part_size: int = DEFAULT_PART_SIZE
     batch: bool = False
 
 
@@ -63,7 +66,9 @@ class Pollen:
         self.config = config
         self.store = store or PollenStore(config.db_path)
         self.uploader = uploader or Uploader(
-            presigner, self.store, multipart_threshold=config.multipart_threshold
+            presigner, self.store,
+            multipart_threshold=config.multipart_threshold,
+            part_size=config.part_size,
         )
         self.archiver = archiver
         self._clock = clock or datetime.now
@@ -111,22 +116,51 @@ class Pollen:
             self._thread = None
 
     def flush(self) -> None:
-        """Drain the queue to empty, still accepting enqueues from other threads."""
-        while self.store.pending_count() > 0 and not self._stop.is_set():
-            self._tick()
-
-    def _loop(self) -> None:
+        """Drain the queue, still accepting enqueues. Returns when empty or when a
+        tick makes no progress (uploads failing) so it never spins forever."""
         while not self._stop.is_set():
+            before = self.store.pending_count()
+            if before == 0:
+                return
             try:
                 self._tick()
-            except Exception:  # never let one bad tick kill the loop
-                logger.exception("pollen tick failed")
-            self._stop.wait(self.config.poll_interval)
+            except RateLimitError:
+                return  # backend throttling; leave the rest durable for next run
+            if self.store.pending_count() >= before:
+                return  # no progress this pass; don't hang the shutdown
+
+    def _loop(self) -> None:
+        consecutive_failures = 0
+        while not self._stop.is_set():
+            try:
+                tick_failures = self._tick()
+            except RateLimitError as exc:
+                consecutive_failures += 1
+                delay = exc.retry_after or min(self.config.poll_interval * 2, MAX_RETRY_DELAY_SECONDS)
+                logger.warning("pollen rate limited; backing off %ss", delay)
+                self._stop.wait(delay)
+                continue
+            except Exception:
+                consecutive_failures += 1
+                delay = min(self.config.poll_interval * (2 ** consecutive_failures), MAX_RETRY_DELAY_SECONDS)
+                logger.exception("pollen tick failed; backing off %ss", delay)
+                self._stop.wait(delay)
+                continue
+            if tick_failures:
+                consecutive_failures += 1
+                delay = min(self.config.poll_interval * (2 ** consecutive_failures), MAX_RETRY_DELAY_SECONDS)
+                logger.warning("pollen: %d upload(s) failed; backing off %ss", tick_failures, delay)
+                self._stop.wait(delay)
+            else:
+                consecutive_failures = 0
+                self._stop.wait(self.config.poll_interval)
 
     # ------------------------------------------------------------------ #
     # the work
     # ------------------------------------------------------------------ #
-    def _tick(self) -> None:
+    def _tick(self) -> int:
+        """Run one upload pass. Returns the number of failed uploads; raises
+        RateLimitError so the loop can honour backend backoff."""
         if self._source is not None:
             try:
                 self._source(self)  # enqueue any ready outputs (results, logs, ...)
@@ -134,28 +168,36 @@ class Pollen:
                 logger.exception("pollen enqueue source failed")
         pending = self.store.claim_pending()
         if self.config.batch and self.archiver is not None:
-            self._upload_batched(pending)
+            failures = self._upload_batched(pending)
         else:
-            for row in pending:
-                self._upload_one(row)
+            failures = sum(0 if self._upload_one(row) else 1 for row in pending)
         self._cleanup()
+        return failures
 
-    def _upload_one(self, row: UploadRow) -> None:
+    def _upload_one(self, row: UploadRow) -> bool:
+        """Upload one row. True on success; False on a per-file error (left pending,
+        not deleted). RateLimitError propagates so the whole loop backs off."""
         try:
             self.store.record_attempt(row.id)
             self.uploader.upload(row)
             self.store.mark_uploaded(row.id)
+            return True
+        except RateLimitError:
+            raise
         except Exception:
-            logger.exception("upload failed for %s", row.s3_key)
+            logger.exception("upload failed for %s (will retry; file kept)", row.s3_key)
+            return False
 
-    def _upload_batched(self, pending: list[UploadRow]) -> None:
+    def _upload_batched(self, pending: list[UploadRow]) -> int:
         # Archive rows already in flight (e.g. from a previous interrupted tick)
         # upload directly; the rest are bundled per group.
-        members = [r for r in pending if r.kind != ARCHIVE_KIND]
+        failures = 0
         for row in (r for r in pending if r.kind == ARCHIVE_KIND):
-            self._upload_one(row)
+            if not self._upload_one(row):
+                failures += 1
+        members = [r for r in pending if r.kind != ARCHIVE_KIND]
         if not members:
-            return
+            return failures
 
         groups: dict[str, list[UploadRow]] = defaultdict(list)
         for row in members:
@@ -175,8 +217,12 @@ class Pollen:
                 self.store.mark_uploaded(tar_id)
                 for item in items:
                     self.store.mark_uploaded(item.id)
+            except RateLimitError:
+                raise
             except Exception:
-                logger.exception("archive upload failed for %s", artifact.s3_key)
+                logger.exception("archive upload failed for %s (will retry)", artifact.s3_key)
+                failures += 1
+        return failures
 
     def _group_of(self, row: UploadRow) -> str:
         # Canonical key is v1/<device>/...; group a batch per device.

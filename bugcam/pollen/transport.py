@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bugcam.pollen import kinds
+from bugcam.pollen.presign import RateLimitError, _parse_retry_after
 from bugcam.pollen.store import PollenStore, UploadRow
 
 try:
@@ -55,6 +56,10 @@ class Uploader:
             raise UploadError("no HTTP session available")
         headers = {"Content-Type": content_type} if content_type else {}
         resp = self._session.put(url, data=data, headers=headers)
+        # S3 throttling comes back as 503 SlowDown; treat it like a rate limit so
+        # the loop backs off instead of hammering.
+        if getattr(resp, "status_code", None) == 503:
+            raise RateLimitError("s3 slowdown", retry_after=_parse_retry_after(resp.headers.get("Retry-After")))
         resp.raise_for_status()
         return resp
 

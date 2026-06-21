@@ -6,7 +6,7 @@ session is injectable for testing.
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 try:
     import requests
@@ -18,6 +18,21 @@ REQUEST_TIMEOUT_SECONDS = 30
 
 class PresignError(Exception):
     """Raised when a presign request fails."""
+
+
+class RateLimitError(Exception):
+    """Raised when the backend signals throttling (HTTP 429)."""
+
+    def __init__(self, message: str, retry_after: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class Presigner:
@@ -44,9 +59,13 @@ class Presigner:
                 headers={"x-api-key": self.api_key},
                 timeout=self.timeout,
             )
+            if getattr(resp, "status_code", None) == 429:
+                raise RateLimitError(
+                    f"{path} rate limited", retry_after=_parse_retry_after(resp.headers.get("Retry-After"))
+                )
             resp.raise_for_status()
             return resp.json()
-        except PresignError:
+        except (PresignError, RateLimitError):
             raise
         except Exception as exc:  # noqa: BLE001 - normalize transport/HTTP errors
             raise PresignError(f"{path} failed: {exc}") from exc

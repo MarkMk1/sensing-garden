@@ -15,6 +15,7 @@ from bugcam.commands.heartbeat import write_heartbeat_snapshot
 from bugcam.commands.upload import upload_ready_results, watch_uploads
 from bugcam.pollen.integration import build_pollen
 from bugcam.pollen.producers import enqueue_ready_outputs, enqueue_result_dir
+from bugcam.pollen.transport import DEFAULT_MULTIPART_THRESHOLD, DEFAULT_PART_SIZE
 from bugcam.config import (
     DEFAULT_API_URL,
     DEFAULT_S3_BUCKET,
@@ -204,11 +205,20 @@ def _release_pid_file(pid_path: Path) -> None:
         pid_path.unlink(missing_ok=True)
 
 
-def _resolve_pollen_enabled(pollen: bool | None) -> bool:
-    """CLI flag wins, else config, else off."""
-    if pollen is not None:
-        return pollen
-    return bool(load_config().get("pollen", False))
+def _resolve_pollen_settings(pollen: bool | None, pollen_batch: bool | None, upload_poll: int) -> dict[str, Any]:
+    """Resolve Pollen settings: CLI flag wins, then the config file, then default.
+
+    Config-file keys: pollen, pollen_batch, pollen_poll_interval,
+    pollen_multipart_threshold, pollen_part_size.
+    """
+    cfg = load_config()
+    return {
+        "enabled": pollen if pollen is not None else bool(cfg.get("pollen", False)),
+        "batch": pollen_batch if pollen_batch is not None else bool(cfg.get("pollen_batch", False)),
+        "poll_interval": float(cfg.get("pollen_poll_interval", upload_poll)),
+        "multipart_threshold": int(cfg.get("pollen_multipart_threshold", DEFAULT_MULTIPART_THRESHOLD)),
+        "part_size": int(cfg.get("pollen_part_size", DEFAULT_PART_SIZE)),
+    }
 
 
 @app.callback()
@@ -242,7 +252,12 @@ def run(
     pollen: bool | None = typer.Option(
         None,
         "--pollen/--no-pollen",
-        help="Use the Pollen upload subsystem for telemetry (heartbeats/environment) (config: pollen)",
+        help="Use the Pollen upload subsystem (owns telemetry, results, logs) (config: pollen)",
+    ),
+    pollen_batch: bool | None = typer.Option(
+        None,
+        "--pollen-batch/--no-pollen-batch",
+        help="Pollen bundles outputs into hourly tars instead of per-object (config: pollen_batch)",
     ),
 ) -> None:
     """Run recording, processing, uploading, and one-minute heartbeat emission."""
@@ -264,19 +279,25 @@ def run(
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        pollen_enabled = _resolve_pollen_enabled(pollen)
+        pollen_settings = _resolve_pollen_settings(pollen, pollen_batch, upload_poll)
+        pollen_enabled = pollen_settings["enabled"]
         pollen_instance = None
         if pollen_enabled:
             pollen_instance = build_pollen(
                 output_dir,
                 settings["api_url"],
                 settings["api_key"],
-                poll_interval=upload_poll,
+                poll_interval=pollen_settings["poll_interval"],
+                multipart_threshold=pollen_settings["multipart_threshold"],
+                part_size=pollen_settings["part_size"],
+                batch=pollen_settings["batch"],
                 enqueue_source=lambda p: enqueue_ready_outputs(
                     p, output_dir, settings["flick_id"], settings["dot_ids"]
                 ),
             )
-            console.print("[dim]Pollen[/dim] owns telemetry, results, and logs")
+            console.print(
+                f"[dim]Pollen[/dim] owns uploads (batch={pollen_settings['batch']})"
+            )
         selected_model = select_model_reference(model)
         provenance = resolve_bundle_provenance(selected_model)
         if model is None:
