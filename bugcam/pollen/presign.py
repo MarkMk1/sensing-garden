@@ -28,6 +28,10 @@ class RateLimitError(Exception):
         self.retry_after = retry_after
 
 
+class MultipartUploadGoneError(PresignError):
+    """The multipart upload no longer exists server-side (aborted or expired)."""
+
+
 def _parse_retry_after(value: Any) -> Optional[int]:
     try:
         return int(value)
@@ -49,7 +53,7 @@ class Presigner:
         self.timeout = timeout
         self._session = session or (requests.Session() if requests else None)
 
-    def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _post(self, path: str, payload: dict[str, Any], *, gone_on_404: bool = False) -> dict[str, Any]:
         if self._session is None:
             raise PresignError("no HTTP session available")
         try:
@@ -59,10 +63,13 @@ class Presigner:
                 headers={"x-api-key": self.api_key},
                 timeout=self.timeout,
             )
-            if getattr(resp, "status_code", None) == 429:
+            status = getattr(resp, "status_code", None)
+            if status == 429:
                 raise RateLimitError(
                     f"{path} rate limited", retry_after=_parse_retry_after(resp.headers.get("Retry-After"))
                 )
+            if gone_on_404 and status == 404:
+                raise MultipartUploadGoneError(f"{path}: multipart upload gone")
             resp.raise_for_status()
             return resp.json()
         except (PresignError, RateLimitError):
@@ -80,10 +87,15 @@ class Presigner:
         return self._post(
             "/multipart/part-url",
             {"s3_key": s3_key, "upload_id": upload_id, "part_number": part_number},
+            gone_on_404=True,
         )["url"]
 
     def complete_multipart(self, s3_key: str, upload_id: str, parts: list[dict[str, Any]]) -> None:
-        self._post("/multipart/complete", {"s3_key": s3_key, "upload_id": upload_id, "parts": parts})
+        self._post(
+            "/multipart/complete",
+            {"s3_key": s3_key, "upload_id": upload_id, "parts": parts},
+            gone_on_404=True,
+        )
 
     def abort_multipart(self, s3_key: str, upload_id: str) -> None:
-        self._post("/multipart/abort", {"s3_key": s3_key, "upload_id": upload_id})
+        self._post("/multipart/abort", {"s3_key": s3_key, "upload_id": upload_id}, gone_on_404=True)

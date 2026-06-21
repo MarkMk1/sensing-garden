@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from bugcam.pollen import kinds
-from bugcam.pollen.presign import RateLimitError, _parse_retry_after
+from bugcam.pollen.presign import MultipartUploadGoneError, RateLimitError, _parse_retry_after
 from bugcam.pollen.store import PollenStore, UploadRow
 
 try:
@@ -20,6 +20,7 @@ except ImportError:
 
 DEFAULT_PART_SIZE = 64 * 1024 * 1024          # 64 MiB
 DEFAULT_MULTIPART_THRESHOLD = 256 * 1024 * 1024  # 256 MiB
+MAX_MULTIPART_ATTEMPTS = 5  # after this many tries, assume the upload id is dead
 
 
 class UploadError(Exception):
@@ -51,15 +52,19 @@ class Uploader:
         else:
             self._multipart(row, path, content_type)
 
-    def _put(self, url: str, data: bytes, content_type: str | None = None) -> Any:
+    def _put(self, url: str, data: bytes, content_type: str | None = None, *, gone_on_404: bool = False) -> Any:
         if self._session is None:
             raise UploadError("no HTTP session available")
         headers = {"Content-Type": content_type} if content_type else {}
         resp = self._session.put(url, data=data, headers=headers)
+        status = getattr(resp, "status_code", None)
         # S3 throttling comes back as 503 SlowDown; treat it like a rate limit so
         # the loop backs off instead of hammering.
-        if getattr(resp, "status_code", None) == 503:
+        if status == 503:
             raise RateLimitError("s3 slowdown", retry_after=_parse_retry_after(resp.headers.get("Retry-After")))
+        # A part PUT to a reaped multipart upload returns 404 NoSuchUpload.
+        if gone_on_404 and status == 404:
+            raise MultipartUploadGoneError("part upload gone")
         resp.raise_for_status()
         return resp
 
@@ -68,27 +73,48 @@ class Uploader:
         with open(path, "rb") as handle:
             self._put(url, handle.read(), content_type)
 
+    def _abort_quietly(self, s3_key: str, upload_id: str) -> None:
+        try:
+            self.presigner.abort_multipart(s3_key, upload_id)
+        except Exception:  # noqa: BLE001 - best effort; the upload may already be gone
+            pass
+
     def _multipart(self, row: UploadRow, path: Path, content_type: str) -> None:
         upload_id = row.upload_id
+        already_done = {p["part_number"] for p in row.parts}
+
+        # Defensive: a multipart stuck across many attempts is most likely on a
+        # dead upload id (e.g. reaped by the abort-incomplete lifecycle rule).
+        # Abort it best-effort and restart from scratch.
+        if upload_id and row.attempts >= MAX_MULTIPART_ATTEMPTS:
+            self._abort_quietly(row.s3_key, upload_id)
+            self.store.reset_multipart(row.id)
+            upload_id, already_done = None, set()
+
         if not upload_id:
             upload_id = self.presigner.create_multipart(row.s3_key)
             self.store.mark_uploading(row.id, upload_id=upload_id)
 
-        already_done = {p["part_number"] for p in row.parts}
-        part_number = 1
-        with open(path, "rb") as handle:
-            while True:
-                chunk = handle.read(self.part_size)
-                if not chunk:
-                    break
-                if part_number not in already_done:
-                    url = self.presigner.part_url(row.s3_key, upload_id, part_number)
-                    resp = self._put(url, chunk, content_type)
-                    etag = resp.headers.get("ETag") or resp.headers.get("etag")
-                    if not etag:
-                        raise UploadError(f"missing ETag for part {part_number} of {row.s3_key}")
-                    self.store.record_part(row.id, part_number, etag)
-                part_number += 1
+        try:
+            part_number = 1
+            with open(path, "rb") as handle:
+                while True:
+                    chunk = handle.read(self.part_size)
+                    if not chunk:
+                        break
+                    if part_number not in already_done:
+                        url = self.presigner.part_url(row.s3_key, upload_id, part_number)
+                        resp = self._put(url, chunk, content_type, gone_on_404=True)
+                        etag = resp.headers.get("ETag") or resp.headers.get("etag")
+                        if not etag:
+                            raise UploadError(f"missing ETag for part {part_number} of {row.s3_key}")
+                        self.store.record_part(row.id, part_number, etag)
+                    part_number += 1
 
-        parts = self.store.get(row.id).parts
-        self.presigner.complete_multipart(row.s3_key, upload_id, parts)
+            parts = self.store.get(row.id).parts
+            self.presigner.complete_multipart(row.s3_key, upload_id, parts)
+        except MultipartUploadGoneError as exc:
+            # The upload was reaped server-side; drop the stale state so the next
+            # attempt starts a fresh multipart.
+            self.store.reset_multipart(row.id)
+            raise UploadError(f"multipart upload gone for {row.s3_key}; will restart") from exc

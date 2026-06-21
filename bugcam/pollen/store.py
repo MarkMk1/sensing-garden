@@ -152,6 +152,15 @@ class PollenStore:
         """Retain the file but keep the row as a dedup tombstone."""
         self._update(row_id, status=UploadStatus.DONE.value)
 
+    def reset_multipart(self, row_id: int) -> None:
+        """Drop a stale multipart upload id + parts so the upload restarts fresh."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE uploads SET upload_id = NULL, parts = '[]', updated_at = ? WHERE id = ?",
+                (_now(), row_id),
+            )
+            self._conn.commit()
+
     def delete(self, row_id: int) -> None:
         with self._lock:
             self._conn.execute("DELETE FROM uploads WHERE id = ?", (row_id,))
