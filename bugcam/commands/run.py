@@ -13,6 +13,7 @@ from rich.console import Console
 
 from bugcam.commands.heartbeat import write_heartbeat_snapshot
 from bugcam.commands.upload import upload_ready_results, watch_uploads
+from bugcam.pollen.integration import build_pollen
 from bugcam.config import (
     DEFAULT_API_URL,
     DEFAULT_S3_BUCKET,
@@ -45,9 +46,12 @@ def _heartbeat_loop(
     output_dir: Path,
     dot_ids: list[str],
     stop_event: threading.Event,
+    pollen: Any = None,
 ) -> None:
     while not stop_event.is_set():
-        write_heartbeat_snapshot(output_dir, flick_id, input_dir, dot_ids)
+        path = write_heartbeat_snapshot(output_dir, flick_id, input_dir, dot_ids)
+        if pollen is not None:
+            pollen.enqueue(path, "heartbeat")  # produce-site enqueue
         stop_event.wait(HEARTBEAT_INTERVAL_SECONDS)
 
 
@@ -55,11 +59,14 @@ def _environment_loop(
     flick_id: str,
     output_dir: Path,
     stop_event: threading.Event,
+    pollen: Any = None,
 ) -> None:
     warning_emitted = False
     while not stop_event.is_set():
         try:
-            collect_environment_reading(output_dir=output_dir, flick_id=flick_id)
+            path, _payload = collect_environment_reading(output_dir=output_dir, flick_id=flick_id)
+            if pollen is not None:
+                pollen.enqueue(path, "environment")
             warning_emitted = False
         except Exception as exc:
             if not warning_emitted:
@@ -196,6 +203,13 @@ def _release_pid_file(pid_path: Path) -> None:
         pid_path.unlink(missing_ok=True)
 
 
+def _resolve_pollen_enabled(pollen: bool | None) -> bool:
+    """CLI flag wins, else config, else off."""
+    if pollen is not None:
+        return pollen
+    return bool(load_config().get("pollen", False))
+
+
 @app.callback()
 def run(
     api_url: str | None = typer.Option(None, "--api-url", help="Backend API URL"),
@@ -224,6 +238,11 @@ def run(
     receiver_port: int = typer.Option(RECEIVER_DEFAULT_PORT, "--receiver-port", help="DOT receiver HTTP port"),
     receiver_host: str = typer.Option(RECEIVER_DEFAULT_HOST, "--receiver-host", help="DOT receiver bind address"),
     detection_config: Path | None = typer.Option(None, "--detection-config", help="Path to detection config YAML file"),
+    pollen: bool | None = typer.Option(
+        None,
+        "--pollen/--no-pollen",
+        help="Use the Pollen upload subsystem for telemetry (heartbeats/environment) (config: pollen)",
+    ),
 ) -> None:
     """Run recording, processing, uploading, and one-minute heartbeat emission."""
     if mode not in {"continuous", "interval"}:
@@ -243,6 +262,14 @@ def run(
         settings = _resolve_runtime_settings(api_url, api_key, flick_id, dot_ids, bucket)
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        pollen_enabled = _resolve_pollen_enabled(pollen)
+        pollen_instance = None
+        if pollen_enabled:
+            pollen_instance = build_pollen(
+                output_dir, settings["api_url"], settings["api_key"], poll_interval=upload_poll
+            )
+            console.print("[dim]Pollen[/dim] owns telemetry uploads")
         selected_model = select_model_reference(model)
         provenance = resolve_bundle_provenance(selected_model)
         if model is None:
@@ -277,6 +304,7 @@ def run(
                 upload_poll,
                 delete_after_upload,
                 upload_stop_event,
+                pollen_enabled,  # skip_telemetry: Pollen owns it when enabled
             ),
             daemon=True,
             name="BugCamUpload",
@@ -289,6 +317,7 @@ def run(
                 output_dir,
                 settings["dot_ids"],
                 heartbeat_stop_event,
+                pollen_instance,
             ),
             daemon=True,
             name="BugCamHeartbeat",
@@ -299,6 +328,7 @@ def run(
                 settings["flick_id"],
                 output_dir,
                 environment_stop_event,
+                pollen_instance,
             ),
             daemon=True,
             name="BugCamEnvironment",
@@ -313,6 +343,8 @@ def run(
                 name="BugCamReceiver",
             )
 
+        if pollen_instance is not None:
+            pollen_instance.start()
         pipeline.start()
         upload_thread.start()
         heartbeat_thread.start()
@@ -343,6 +375,10 @@ def run(
             environment_thread.join(timeout=1)
         if "receiver_thread" in locals() and receiver_thread:
             receiver_thread.join(timeout=5)
+        # Stop Pollen's loop after finishing the current tick; anything still
+        # queued is durable in SQLite and resumes on the next launch.
+        if "pollen_instance" in locals() and pollen_instance is not None:
+            pollen_instance.stop()
         if "settings" in locals():
             upload_ready_results(
                 output_dir,
@@ -352,5 +388,6 @@ def run(
                 settings["dot_ids"],
                 delete_after_upload,
                 False,
+                "pollen_enabled" in locals() and pollen_enabled,
             )
         _release_pid_file(pid_path)

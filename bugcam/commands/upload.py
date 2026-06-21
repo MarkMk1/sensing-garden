@@ -263,10 +263,18 @@ def upload_ready_results(
     dot_ids: list[str],
     delete_after_upload: bool,
     manifest_uploaded: bool,
+    skip_telemetry: bool = False,
 ) -> tuple[int, bool]:
-    """Upload all ready result directories once."""
-    processed_count = _upload_heartbeat_files(output_dir, api_url, api_key)
-    processed_count += _upload_environment_files(output_dir, api_url, api_key)
+    """Upload all ready result directories once.
+
+    When ``skip_telemetry`` is set, heartbeats and environment readings are left
+    to Pollen (which owns them at the produce site); this path still ships logs,
+    the manifest, and results.
+    """
+    processed_count = 0
+    if not skip_telemetry:
+        processed_count += _upload_heartbeat_files(output_dir, api_url, api_key)
+        processed_count += _upload_environment_files(output_dir, api_url, api_key)
     processed_count += _upload_log_files(output_dir, api_url, api_key)
     if not manifest_uploaded and _list_result_directories(output_dir):
         upload_manifest(api_url, api_key, flick_id, dot_ids)
@@ -304,6 +312,7 @@ def watch_uploads(
     poll_interval: int,
     delete_after_upload: bool,
     stop_event: threading.Event,
+    skip_telemetry: bool = False,
 ) -> None:
     """Poll an output directory and upload ready results."""
     manifest_uploaded = False
@@ -318,6 +327,7 @@ def watch_uploads(
                 dot_ids,
                 delete_after_upload,
                 manifest_uploaded,
+                skip_telemetry,
             )
             consecutive_failures = 0
             stop_event.wait(poll_interval)
