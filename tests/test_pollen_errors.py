@@ -18,7 +18,7 @@ class _Resp:
         self.headers = headers or {}
 
     def json(self):
-        return {"url": "u", "upload_id": "UP"}
+        return {"upload_url": "u", "upload_id": "UP"}
 
     def raise_for_status(self):
         if self.status_code >= 400:

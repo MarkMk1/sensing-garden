@@ -78,7 +78,8 @@ class Presigner:
             raise PresignError(f"{path} failed: {exc}") from exc
 
     def put_url(self, s3_key: str) -> str:
-        return self._post("/upload-url", {"s3_key": s3_key})["url"]
+        # Backend returns {"upload_url": ...} (matches the existing /upload-url API).
+        return self._post("/upload-url", {"s3_key": s3_key})["upload_url"]
 
     def create_multipart(self, s3_key: str) -> str:
         return self._post("/multipart/create", {"s3_key": s3_key})["upload_id"]
@@ -88,7 +89,7 @@ class Presigner:
             "/multipart/part-url",
             {"s3_key": s3_key, "upload_id": upload_id, "part_number": part_number},
             gone_on_404=True,
-        )["url"]
+        )["upload_url"]
 
     def complete_multipart(self, s3_key: str, upload_id: str, parts: list[dict[str, Any]]) -> None:
         self._post(

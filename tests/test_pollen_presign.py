@@ -38,7 +38,7 @@ def _presigner(responses):
 
 class TestPresigner:
     def test_put_url(self):
-        p, session = _presigner([_Resp({"url": "https://s3/put?sig=1"})])
+        p, session = _presigner([_Resp({"upload_url": "https://s3/put?sig=1"})])
         url = p.put_url("v1/a/results.json")
         assert url == "https://s3/put?sig=1"
         call = session.calls[0]
@@ -49,7 +49,7 @@ class TestPresigner:
     def test_multipart_lifecycle(self):
         p, session = _presigner([
             _Resp({"upload_id": "UP-1"}),
-            _Resp({"url": "https://s3/part1"}),
+            _Resp({"upload_url": "https://s3/part1"}),
             _Resp({}),
         ])
         upload_id = p.create_multipart("v2/archives/d/x.tar")
@@ -73,6 +73,6 @@ class TestPresigner:
             p.put_url("v1/a/results.json")
 
     def test_trailing_slash_normalized(self):
-        p, session = _presigner([_Resp({"url": "u"})])
+        p, session = _presigner([_Resp({"upload_url": "u"})])
         p.put_url("k")
         assert session.calls[0]["url"] == "https://api.example.com/v1/upload-url"
