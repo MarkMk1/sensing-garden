@@ -152,6 +152,14 @@ def _resolve_runtime_settings(
     }
 
 
+def _resolve_archive_settings(archive: bool | None, archive_interval: int | None) -> tuple[bool, int]:
+    """Resolve hourly-archiving settings: CLI flag wins, then config, then default."""
+    config = load_config()
+    enabled = archive if archive is not None else bool(config.get("archive", False))
+    interval = archive_interval if archive_interval is not None else int(config.get("archive_interval", 3600))
+    return enabled, interval
+
+
 def _process_is_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -217,12 +225,14 @@ def run(
         "--delete-after-upload/--no-delete-after-upload",
         help="Clean up results after uploading",
     ),
-    archive: bool = typer.Option(
-        False,
+    archive: bool | None = typer.Option(
+        None,
         "--archive/--no-archive",
-        help="Batch results, heartbeats, environment, and logs into hourly tars instead of per-object uploads",
+        help="Batch results, heartbeats, environment, and logs into hourly tars instead of per-object uploads (config: archive)",
     ),
-    archive_interval: int = typer.Option(3600, "--archive-interval", help="Seconds between hourly archive runs"),
+    archive_interval: int | None = typer.Option(
+        None, "--archive-interval", help="Seconds between hourly archive runs (config: archive_interval, default 3600)"
+    ),
     with_receiver: bool = typer.Option(
         True,
         "--with-receiver/--no-receiver",
@@ -248,6 +258,7 @@ def run(
             console.print(f"[yellow]Warning[/yellow] {ntp_detail}")
 
         settings = _resolve_runtime_settings(api_url, api_key, flick_id, dot_ids, bucket)
+        archive, archive_interval = _resolve_archive_settings(archive, archive_interval)
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         selected_model = select_model_reference(model)
