@@ -21,8 +21,8 @@ The manifest is deliberately NOT batched: the backend reads it at the fixed key
 ``v1/manifest.json`` on every result ingest, and it is uploaded once per run, so
 it stays on the live per-object path.
 
-Tar members mirror the local dir tree (``<device>/...``), which is the bucket
-layout minus the ``v1/`` prefix.
+Tar members are named with their canonical S3 key (``v1/<device>/...``), so the
+tar is a self-describing bundle of v1 objects however the backend consumes it.
 """
 from __future__ import annotations
 
@@ -51,6 +51,14 @@ ARCHIVED_STATE_FILENAME = ".archived"
 AUX_STATE_FILENAME = ".archived-aux"
 STAGING_DIRNAME = ".archive_staging"
 AUX_KINDS = ("heartbeats", "environment", "logs")
+
+# Members are named with their canonical S3 key so the tar is a self-describing
+# bundle of v1 objects -- the same prefix the live per-object path uploads to.
+KEY_PREFIX = "v1"
+
+
+def _arcname(output_dir: Path, path: Path) -> str:
+    return f"{KEY_PREFIX}/{path.relative_to(output_dir).as_posix()}"
 
 # Sidecars and state files that must never be shipped inside an archive.
 _SIDECAR_NAMES = {
@@ -165,7 +173,7 @@ def _collect_flik_results(output_dir: Path, device_dir: Path, member_files: list
             continue
         for path in sorted(results_dir.rglob("*")):
             if path.is_file() and path.name not in _SIDECAR_NAMES:
-                member_files.append((path.relative_to(output_dir).as_posix(), path))
+                member_files.append((_arcname(output_dir, path), path))
         bundled.append(results_dir)
     return bundled
 
@@ -219,14 +227,14 @@ def _collect_dot_delta(
     # Self-contained delta: results.json holds only the new tracks.
     delta = dict(results)
     delta["tracks"] = new_tracks
-    arc_results = (results_dir.relative_to(output_dir) / RESULTS_FILENAME).as_posix()
+    arc_results = _arcname(output_dir, results_dir / RESULTS_FILENAME)
     member_data.append((arc_results, json.dumps(delta).encode("utf-8")))
 
     for track in new_tracks:
         for path in _dot_track_media(results_dir, str(track["track_id"])):
-            member_files.append((path.relative_to(output_dir).as_posix(), path))
+            member_files.append((_arcname(output_dir, path), path))
     for path in new_files:
-        member_files.append((path.relative_to(output_dir).as_posix(), path))
+        member_files.append((_arcname(output_dir, path), path))
 
     return {
         "results_dir": results_dir,
@@ -271,7 +279,7 @@ def _collect_aux(
             fingerprint = _fingerprint(path)
             if archived.get(path.name) == fingerprint:
                 continue
-            member_files.append((path.relative_to(output_dir).as_posix(), path))
+            member_files.append((_arcname(output_dir, path), path))
             archived[path.name] = fingerprint
             changed = True
     return state, changed

@@ -16,13 +16,10 @@ cross-object fallback):
   state. No new tracks -> no tar. The day-bucket is not deleted here (that is
   separate cleanup).
 
-Tar members mirror the local dir tree (``<device>/<date_time>/...``), which is
-the bucket layout minus the ``v1/`` prefix. Shipping goes through
+Tar members are named with their canonical S3 key (``v1/<device>/<date_time>/...``)
+so the tar is a self-describing bundle of v1 objects. Shipping goes through
 ``archive.upload_file`` (the multipart-capable client), patched here so no
 network or AWS is touched.
-
-TESTS WRITTEN FIRST: the ``bugcam.commands.archive`` module does not exist yet,
-so this whole file is RED until the archiver lands.
 """
 import json
 import tarfile
@@ -117,8 +114,8 @@ class TestFlikArchive:
 
         assert len(captured) == 1
         assert captured[0]["s3_key"] == "v2/archives/flick1/20260204_130000.tar"
-        assert "flick1/20260204_120000/results.json" in captured[0]["members"]
-        assert "flick1/20260204_120000/crops/t1/frame_000000.jpg" in captured[0]["members"]
+        assert "v1/flick1/20260204_120000/results.json" in captured[0]["members"]
+        assert "v1/flick1/20260204_120000/crops/t1/frame_000000.jpg" in captured[0]["members"]
         # shipped -> removed locally
         assert not results_dir.exists()
 
@@ -169,8 +166,8 @@ class TestDotDeltaArchive:
 
         assert len(captured) == 1
         assert captured[0]["s3_key"] == "v2/archives/dot1/20260204_130000.tar"
-        assert "dot1/20260204/results.json" in captured[0]["members"]
-        assert "dot1/20260204/crops/t1_120100/frame_000000.jpg" in captured[0]["members"]
+        assert "v1/dot1/20260204/results.json" in captured[0]["members"]
+        assert "v1/dot1/20260204/crops/t1_120100/frame_000000.jpg" in captured[0]["members"]
 
     def test_delta_results_json_holds_only_new_tracks(self, tmp_path, mocker):
         out = tmp_path / "out"
@@ -188,8 +185,8 @@ class TestDotDeltaArchive:
         assert len(captured) == 1
         # the delta tar carries t2 only, and it is self-contained
         members = captured[0]["members"]
-        assert "dot1/20260204/crops/t2_120500/frame_000000.jpg" in members
-        assert "dot1/20260204/crops/t1_120100/frame_000000.jpg" not in members
+        assert "v1/dot1/20260204/crops/t2_120500/frame_000000.jpg" in members
+        assert "v1/dot1/20260204/crops/t1_120100/frame_000000.jpg" not in members
 
     def test_delta_results_json_payload_filtered(self, tmp_path, mocker):
         out = tmp_path / "out"
@@ -203,7 +200,7 @@ class TestDotDeltaArchive:
 
         def _grab(api_url, api_key, local_path, s3_key):
             with tarfile.open(local_path) as tf:
-                member = tf.extractfile("dot1/20260204/results.json")
+                member = tf.extractfile("v1/dot1/20260204/results.json")
                 captured_payload["data"] = json.load(member)
 
         mocker.patch.object(archive, "upload_file", side_effect=_grab)
@@ -257,7 +254,7 @@ class TestSelfContainment:
         def _grab(api_url, api_key, local_path, s3_key):
             with tarfile.open(local_path) as tf:
                 names = set(tf.getnames())
-                member = tf.extractfile("dot1/20260204/results.json")
+                member = tf.extractfile("v1/dot1/20260204/results.json")
                 captured_members["names"] = names
                 captured_members["tracks"] = json.load(member)["tracks"]
 
@@ -267,7 +264,7 @@ class TestSelfContainment:
         # every track in the shipped results.json must have its crop dir present
         for track in captured_members["tracks"]:
             tid, ts = track["track_id"], track["timestamp"]
-            crop = f"dot1/20260204/crops/{tid}_{ts}/frame_000000.jpg"
+            crop = f"v1/dot1/20260204/crops/{tid}_{ts}/frame_000000.jpg"
             assert crop in captured_members["names"], f"missing media for {tid}"
 
     def test_no_tar_when_device_has_nothing(self, tmp_path, mocker):
@@ -301,7 +298,7 @@ class TestAuxArtifacts:
         _run(out)
 
         assert len(captured) == 1
-        assert "flick1/heartbeats/hb_120000.json" in captured[0]["members"]
+        assert "v1/flick1/heartbeats/hb_120000.json" in captured[0]["members"]
 
     def test_environment_bundled(self, tmp_path, mocker):
         out = tmp_path / "out"
@@ -310,7 +307,7 @@ class TestAuxArtifacts:
 
         _run(out)
 
-        assert "flick1/environment/env_120000.json" in captured[0]["members"]
+        assert "v1/flick1/environment/env_120000.json" in captured[0]["members"]
 
     def test_aux_shipped_once(self, tmp_path, mocker):
         out = tmp_path / "out"
@@ -334,8 +331,8 @@ class TestAuxArtifacts:
         _run(out, now=datetime.now())
 
         members = captured[0]["members"]
-        assert f"flick1/logs/edge26_{yesterday}.log" in members
-        assert f"flick1/logs/edge26_{today}.log" not in members  # active log left out
+        assert f"v1/flick1/logs/edge26_{yesterday}.log" in members
+        assert f"v1/flick1/logs/edge26_{today}.log" not in members  # active log left out
 
     def test_aux_rides_with_result_units(self, tmp_path, mocker):
         out = tmp_path / "out"
@@ -348,8 +345,8 @@ class TestAuxArtifacts:
         # one tar for the device, carrying both the result unit and the heartbeat
         assert len(captured) == 1
         members = captured[0]["members"]
-        assert "flick1/20260204_120000/results.json" in members
-        assert "flick1/heartbeats/hb_120000.json" in members
+        assert "v1/flick1/20260204_120000/results.json" in members
+        assert "v1/flick1/heartbeats/hb_120000.json" in members
 
     def test_aux_state_not_bundled(self, tmp_path, mocker):
         out = tmp_path / "out"
