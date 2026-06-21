@@ -4,7 +4,9 @@ Bundles queued items into one uncompressed tar whose members are named by their
 canonical v1 keys, shipped to v2/archives/<group>/<ts>.tar -- the same shape the
 backend ingestion branches consume.
 """
+import json
 import tarfile
+from pathlib import Path
 
 from bugcam.pollen.archive import ArchiveArtifact, Archiver, TarArchiver
 from bugcam.pollen.store import UploadRow, UploadStatus
@@ -59,3 +61,20 @@ class TestTarArchiver:
         archiver = TarArchiver(archive_key_prefix="v2/batches")
         artifact = archiver.pack("dot1", items, tmp_path / "s", timestamp="20260204_130000")
         assert artifact.s3_key == "v2/batches/dot1/20260204_130000.tar"
+
+
+class TestOffsetIndex:
+    def test_sibling_index_slices_tar_to_member_bytes(self, tmp_path):
+        items = _make_items(tmp_path)
+        artifact = TarArchiver().pack("flick1", items, tmp_path / "staging", timestamp="20260204_130000")
+
+        assert artifact.index_s3_key == "v2/archives/flick1/20260204_130000.tar.idx"
+        assert artifact.index_path.exists()
+
+        tar_bytes = artifact.path.read_bytes()
+        members = json.loads(artifact.index_path.read_text())["members"]
+        # every member's recorded byte range slices the archive back to its bytes
+        for it in items:
+            entry = members[it.s3_key]
+            sliced = tar_bytes[entry["offset"]:entry["offset"] + entry["size"]]
+            assert sliced == Path(it.local_path).read_bytes()

@@ -9,6 +9,7 @@ same interface later.
 """
 from __future__ import annotations
 
+import json
 import tarfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -23,6 +24,11 @@ class ArchiveArtifact:
     path: Path              # the staged archive file to upload
     s3_key: str             # where the archive is uploaded
     member_keys: list[str]  # the s3_keys bundled, to mark uploaded once shipped
+    # Sibling offset index: {member_key: {offset, size}} of every member's bytes in
+    # the (uncompressed) tar, so the backend can read member ranges without
+    # downloading the whole archive. Uploaded next to the tar as <tar>.idx.
+    index_path: Optional[Path] = None
+    index_s3_key: Optional[str] = None
 
 
 class Archiver(ABC):
@@ -59,4 +65,26 @@ class TarArchiver(Archiver):
         with tarfile.open(tar_path, "w") as tar:  # uncompressed -> valid member offsets
             for item in items:
                 tar.add(item.local_path, arcname=item.s3_key)
-        return ArchiveArtifact(path=tar_path, s3_key=s3_key, member_keys=[it.s3_key for it in items])
+
+        index_path, index_s3_key = self._write_index(tar_path, s3_key)
+        return ArchiveArtifact(
+            path=tar_path,
+            s3_key=s3_key,
+            member_keys=[it.s3_key for it in items],
+            index_path=index_path,
+            index_s3_key=index_s3_key,
+        )
+
+    @staticmethod
+    def _write_index(tar_path: Path, s3_key: str) -> tuple[Path, str]:
+        """Write a sibling <tar>.idx mapping each member to its byte range, so the
+        backend can range-read members without pulling the whole archive."""
+        members: dict[str, dict[str, int]] = {}
+        with tarfile.open(tar_path, "r:") as tar:  # uncompressed -> offset_data is a byte offset
+            for member in tar.getmembers():
+                if member.isfile():
+                    members[member.name] = {"offset": member.offset_data, "size": member.size}
+        index_path = tar_path.with_suffix(tar_path.suffix + ".idx")
+        index_s3_key = s3_key + ".idx"
+        index_path.write_text(json.dumps({"members": members}), encoding="utf-8")
+        return index_path, index_s3_key
