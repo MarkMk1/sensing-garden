@@ -390,47 +390,61 @@ class Pipeline:
         while not self.stop_event.is_set():
             try:
                 video_path = self.video_queue.get(timeout=1.0)
-                self._process_video_detection(video_path)
-                self.video_queue.task_done()
-                
-                # Check for DOT directories after each video (interleaved processing)
-                for dot_dir in self._find_dot_directories():
-                    if self.stop_event.is_set():
-                        break
-                    self._process_dot_media(dot_dir)
-                    self._process_dot_directory_detection(dot_dir)
-                
-                # Periodically sweep stale output directories
+            except queue.Empty:
+                # A timeout is the idle tick, not an error — fall through with no
+                # video so the DOT drain and completion check still run.
+                video_path = None
+
+            try:
+                if video_path is not None:
+                    self._process_video_detection(video_path)
+                    self.video_queue.task_done()
+
+                # Interleave DOT processing on every tick — after a video and
+                # while idle — so DOT work never starves and the loop body is not
+                # duplicated across the busy and idle paths.
+                self._drain_dot_directories()
+
+                # On an idle tick, stop once the whole pipeline has drained.
+                if video_path is None and self._processing_complete():
+                    logger.info("Queue empty - processing complete")
+                    break
+            except Exception as e:
+                logger.error(f"Detection error: {e}", exc_info=True)
+            finally:
+                # Sweep stale output directories periodically. Advances once per
+                # tick (idle included) so stuck directories are still reclaimed
+                # during quiet stretches when no FLIK video is flowing.
                 self._sweep_counter += 1
                 if self._sweep_counter >= self._sweep_interval:
                     self._sweep_stale_directories()
                     self._sweep_counter = 0
-                
-            except queue.Empty:
-                # Check for new DOT directories while waiting
-                for dot_dir in self._find_dot_directories():
-                    if self.stop_event.is_set():
-                        break
-                    self._process_dot_media(dot_dir)
-                    self._process_dot_directory_detection(dot_dir)
-                
-                # If recording stopped, check if we're done
-                if self.recording_stopped.is_set():
-                    remaining = self.video_queue.qsize()
-                    has_ready_tracks = any(
-                        self._find_ready_dot_tracks(d)
-                        for d in self._find_dot_directories()
-                    )
-                    pending_count = self.classification_queue.count()
-                    if remaining == 0 and not has_ready_tracks and pending_count == 0:
-                        logger.info("Queue empty - processing complete")
-                        break
-                continue
-            except Exception as e:
-                logger.error(f"Detection error: {e}", exc_info=True)
-        
+
         logger.info("Detection worker stopped")
-    
+
+    def _drain_dot_directories(self) -> None:
+        """Process every ready DOT directory once (media copy + ready tracks)."""
+        for dot_dir in self._find_dot_directories():
+            if self.stop_event.is_set():
+                break
+            self._process_dot_media(dot_dir)
+            self._process_dot_directory_detection(dot_dir)
+
+    def _processing_complete(self) -> bool:
+        """True once recording has stopped and every backlog is drained.
+
+        Checks the detection thread's own work (video queue, ready DOT tracks)
+        and the classification thread's backlog (classification_queue.count()),
+        so the producer only terminates after the consumer has nothing left.
+        """
+        if not self.recording_stopped.is_set():
+            return False
+        if self.video_queue.qsize() > 0:
+            return False
+        if any(self._find_ready_dot_tracks(d) for d in self._find_dot_directories()):
+            return False
+        return self.classification_queue.count() == 0
+
     def _process_video_detection(self, video_path: Path) -> None:
         """
         Process a FLIK video: detection/tracking only, queue crops for classification.
