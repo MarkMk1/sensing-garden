@@ -12,6 +12,7 @@ import typer
 from rich.console import Console
 
 from bugcam.commands.heartbeat import write_heartbeat_snapshot
+from bugcam.commands.archive import build_archives, watch_archives
 from bugcam.commands.upload import upload_ready_results, watch_uploads
 from bugcam.config import (
     DEFAULT_API_URL,
@@ -216,6 +217,12 @@ def run(
         "--delete-after-upload/--no-delete-after-upload",
         help="Clean up results after uploading",
     ),
+    archive: bool = typer.Option(
+        False,
+        "--archive/--no-archive",
+        help="Batch results, heartbeats, environment, and logs into hourly tars instead of per-object uploads",
+    ),
+    archive_interval: int = typer.Option(3600, "--archive-interval", help="Seconds between hourly archive runs"),
     with_receiver: bool = typer.Option(
         True,
         "--with-receiver/--no-receiver",
@@ -266,6 +273,7 @@ def run(
         heartbeat_stop_event = threading.Event()
         environment_stop_event = threading.Event()
         receiver_stop_event = threading.Event()
+        archive_stop_event = threading.Event()
         upload_thread = threading.Thread(
             target=watch_uploads,
             args=(
@@ -277,10 +285,27 @@ def run(
                 upload_poll,
                 delete_after_upload,
                 upload_stop_event,
+                archive,  # archive_mode: when batching, this path ships manifest only
             ),
             daemon=True,
             name="BugCamUpload",
         )
+        archive_thread = None
+        if archive:
+            archive_thread = threading.Thread(
+                target=watch_archives,
+                args=(
+                    output_dir,
+                    settings["api_url"],
+                    settings["api_key"],
+                    settings["flick_id"],
+                    settings["dot_ids"],
+                    archive_interval,
+                    archive_stop_event,
+                ),
+                daemon=True,
+                name="BugCamArchive",
+            )
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
             args=(
@@ -317,6 +342,9 @@ def run(
         upload_thread.start()
         heartbeat_thread.start()
         environment_thread.start()
+        if archive_thread:
+            archive_thread.start()
+            console.print(f"[dim]Archiving[/dim] hourly tars every {archive_interval}s")
         if receiver_thread:
             receiver_thread.start()
             console.print(f"[dim]Receiver[/dim] http://{receiver_host}:{receiver_port}")
@@ -333,6 +361,8 @@ def run(
             heartbeat_stop_event.set()
         if "environment_stop_event" in locals():
             environment_stop_event.set()
+        if "archive_stop_event" in locals():
+            archive_stop_event.set()
         if "receiver_stop_event" in locals() and receiver_thread:
             receiver_stop_event.set()
         if "upload_thread" in locals():
@@ -341,9 +371,21 @@ def run(
             heartbeat_thread.join(timeout=1)
         if "environment_thread" in locals():
             environment_thread.join(timeout=1)
+        if "archive_thread" in locals() and archive_thread:
+            archive_thread.join(timeout=5)
         if "receiver_thread" in locals() and receiver_thread:
             receiver_thread.join(timeout=5)
         if "settings" in locals():
+            # Final flush: when batching, sweep remaining work into one last tar
+            # and ship the manifest only; otherwise drain via the per-object path.
+            if archive:
+                build_archives(
+                    output_dir,
+                    settings["flick_id"],
+                    settings["dot_ids"],
+                    settings["api_url"],
+                    settings["api_key"],
+                )
             upload_ready_results(
                 output_dir,
                 settings["api_url"],
@@ -352,5 +394,6 @@ def run(
                 settings["dot_ids"],
                 delete_after_upload,
                 False,
+                archive,
             )
         _release_pid_file(pid_path)

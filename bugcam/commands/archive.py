@@ -5,22 +5,31 @@ Bundles each device's ready output into one tar per run at
 many small per-object PUTs the live v1 path makes today. Additive: this path
 only runs when enabled and never touches the v1 upload path.
 
-- FLIK: each finalized ``.done`` chunk dir is already terminal, so it is
-  bundled whole (minus sidecars) and deleted locally after a successful ship.
+Bundled per device, in one tar:
+- FLIK: each finalized ``.done`` chunk dir is bundled whole (minus sidecars)
+  and deleted locally after a successful ship.
 - DOT: the day-bucket grows all day, so each run ships a *delta* -- a
   results.json filtered to tracks new since the last archive plus only those
   tracks' media -- so every tar is self-contained (the backend resolves media
   by path relative to results.json with no cross-object fallback). Archived
-  track-ids accumulate in a per-bucket ``.archived`` state; the bucket itself
-  is retained (day-bucket cleanup is handled separately).
+  track-ids accumulate in a per-bucket ``.archived`` state; the bucket is kept.
+- Heartbeats, environment, and logs: files new since the last archive, tracked
+  in a per-device ``.archived-aux`` state. The active (today's) log is skipped
+  until it rolls over.
 
-Tar members mirror the local dir tree (``<device>/<date_time>/...``), which is
-the bucket layout minus the ``v1/`` prefix.
+The manifest is deliberately NOT batched: the backend reads it at the fixed key
+``v1/manifest.json`` on every result ingest, and it is uploaded once per run, so
+it stays on the live per-object path.
+
+Tar members mirror the local dir tree (``<device>/...``), which is the bucket
+layout minus the ``v1/`` prefix.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import logging
 import shutil
 import tarfile
 from datetime import datetime
@@ -36,8 +45,12 @@ from bugcam.s3_upload import (
     upload_file,
 )
 
+logger = logging.getLogger("bugcam.archive")
+
 ARCHIVED_STATE_FILENAME = ".archived"
+AUX_STATE_FILENAME = ".archived-aux"
 STAGING_DIRNAME = ".archive_staging"
+AUX_KINDS = ("heartbeats", "environment", "logs")
 
 # Sidecars and state files that must never be shipped inside an archive.
 _SIDECAR_NAMES = {
@@ -47,6 +60,7 @@ _SIDECAR_NAMES = {
     COMPLETED_TRACKS_FILENAME,
     UPLOADED_STATE_FILENAME,
     ARCHIVED_STATE_FILENAME,
+    AUX_STATE_FILENAME,
     f"{RESULTS_FILENAME}.tmp",
 }
 
@@ -64,25 +78,85 @@ def build_archives(
     output_dir = Path(output_dir)
     if not output_dir.exists():
         return []
-    timestamp = (now or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    moment = now or datetime.now()
+    timestamp = moment.strftime("%Y%m%d_%H%M%S")
+    today = moment.strftime("%Y%m%d")
 
     shipped: list[str] = []
-    shipped += _archive_flik_device(output_dir, flick_id, api_url, api_key, timestamp)
-    for dot_id in dot_ids:
-        shipped += _archive_dot_device(output_dir, dot_id, api_url, api_key, timestamp)
+    for device_id, is_flik in [(flick_id, True)] + [(dot_id, False) for dot_id in dot_ids]:
+        key = _archive_device(output_dir, device_id, is_flik, api_url, api_key, timestamp, today)
+        if key:
+            shipped.append(key)
     return shipped
+
+
+def watch_archives(
+    output_dir: Path,
+    api_url: str,
+    api_key: str,
+    flick_id: str,
+    dot_ids: list[str],
+    interval_seconds: int,
+    stop_event,
+) -> None:
+    """Run hourly batched archiving until stopped."""
+    while not stop_event.is_set():
+        try:
+            build_archives(output_dir, flick_id, dot_ids, api_url, api_key)
+        except Exception:  # never let one bad run kill the cadence thread
+            logger.exception("Archive run failed")
+        stop_event.wait(interval_seconds)
+
+
+# --------------------------------------------------------------------------- #
+# per-device: results (FLIK whole / DOT delta) + aux, in one tar
+# --------------------------------------------------------------------------- #
+def _archive_device(
+    output_dir: Path,
+    device_id: str,
+    is_flik: bool,
+    api_url: str,
+    api_key: str,
+    timestamp: str,
+    today: str,
+) -> str | None:
+    device_dir = output_dir / device_id
+    if not device_dir.is_dir():
+        return None
+
+    member_files: list[tuple[str, Path]] = []
+    member_data: list[tuple[str, bytes]] = []
+
+    flik_dirs: list[Path] = []
+    dot_states: list[dict] = []
+    if is_flik:
+        flik_dirs = _collect_flik_results(output_dir, device_dir, member_files)
+    else:
+        dot_states = _collect_dot_results(output_dir, device_dir, member_files, member_data)
+
+    aux_state, aux_changed = _collect_aux(output_dir, device_dir, member_files, today)
+
+    if not member_files and not member_data:
+        return None
+
+    s3_key = f"v2/archives/{device_id}/{timestamp}.tar"
+    _ship_tar(output_dir, s3_key, member_files, member_data, api_url, api_key)
+
+    # Persist state only after a successful ship.
+    for results_dir in flik_dirs:
+        shutil.rmtree(results_dir)
+    for state in dot_states:
+        _save_archived_state(state["results_dir"], {"track_ids": state["track_ids"], "files": state["files"]})
+    if aux_changed:
+        _save_aux_state(device_dir, aux_state)
+    return s3_key
 
 
 # --------------------------------------------------------------------------- #
 # FLIK: whole finalized dirs, bundled then deleted
 # --------------------------------------------------------------------------- #
-def _archive_flik_device(output_dir: Path, flick_id: str, api_url: str, api_key: str, timestamp: str) -> list[str]:
-    device_dir = output_dir / flick_id
-    if not device_dir.is_dir():
-        return []
-
-    member_files: list[tuple[str, Path]] = []
-    bundled_dirs: list[Path] = []
+def _collect_flik_results(output_dir: Path, device_dir: Path, member_files: list[tuple[str, Path]]) -> list[Path]:
+    bundled: list[Path] = []
     for results_dir in _result_dirs(device_dir):
         if not (results_dir / DONE_MARKER_FILENAME).exists():
             continue  # not finished classifying yet; leave for a later run
@@ -92,42 +166,25 @@ def _archive_flik_device(output_dir: Path, flick_id: str, api_url: str, api_key:
         for path in sorted(results_dir.rglob("*")):
             if path.is_file() and path.name not in _SIDECAR_NAMES:
                 member_files.append((path.relative_to(output_dir).as_posix(), path))
-        bundled_dirs.append(results_dir)
-
-    if not bundled_dirs:
-        return []
-
-    s3_key = f"v2/archives/{flick_id}/{timestamp}.tar"
-    _ship_tar(output_dir, s3_key, member_files, [], api_url, api_key)
-    for results_dir in bundled_dirs:
-        shutil.rmtree(results_dir)
-    return [s3_key]
+        bundled.append(results_dir)
+    return bundled
 
 
 # --------------------------------------------------------------------------- #
 # DOT: hourly delta of new tracks, self-contained, state accumulates
 # --------------------------------------------------------------------------- #
-def _archive_dot_device(output_dir: Path, dot_id: str, api_url: str, api_key: str, timestamp: str) -> list[str]:
-    device_dir = output_dir / dot_id
-    if not device_dir.is_dir():
-        return []
-
-    member_files: list[tuple[str, Path]] = []
-    member_data: list[tuple[str, bytes]] = []
-    pending_states: list[dict] = []
+def _collect_dot_results(
+    output_dir: Path,
+    device_dir: Path,
+    member_files: list[tuple[str, Path]],
+    member_data: list[tuple[str, bytes]],
+) -> list[dict]:
+    states: list[dict] = []
     for results_dir in _result_dirs(device_dir):
         state = _collect_dot_delta(output_dir, results_dir, member_files, member_data)
         if state is not None:
-            pending_states.append(state)
-
-    if not pending_states:
-        return []
-
-    s3_key = f"v2/archives/{dot_id}/{timestamp}.tar"
-    _ship_tar(output_dir, s3_key, member_files, member_data, api_url, api_key)
-    for state in pending_states:
-        _save_archived_state(state["results_dir"], {"track_ids": state["track_ids"], "files": state["files"]})
-    return [s3_key]
+            states.append(state)
+    return states
 
 
 def _collect_dot_delta(
@@ -147,7 +204,7 @@ def _collect_dot_delta(
     results = _load_results(results_dir)
     new_tracks = [t for t in results.get("tracks", []) if str(t["track_id"]) not in archived_tracks]
 
-    # Loose media not tied to a track (videos, backgrounds): ship newly arrived.
+    # Loose media not tied to a track (videos): ship newly arrived files.
     new_files: list[Path] = []
     for sub in ("videos",):
         sub_dir = results_dir / sub
@@ -191,6 +248,36 @@ def _dot_track_media(results_dir: Path, track_id: str) -> list[Path]:
 
 
 # --------------------------------------------------------------------------- #
+# aux artifacts: heartbeats + environment + logs (delta since last archive)
+# --------------------------------------------------------------------------- #
+def _collect_aux(
+    output_dir: Path,
+    device_dir: Path,
+    member_files: list[tuple[str, Path]],
+    today: str,
+) -> tuple[dict, bool]:
+    state = _load_aux_state(device_dir)
+    changed = False
+    for kind in AUX_KINDS:
+        kind_dir = device_dir / kind
+        if not kind_dir.is_dir():
+            continue
+        archived = state.setdefault(kind, {})
+        for path in sorted(p for p in kind_dir.iterdir() if p.is_file()):
+            if path.name.startswith("."):
+                continue  # live-path state files (.uploaded-*) etc.
+            if kind == "logs" and today in path.name:
+                continue  # active log is appended all day; ship after rollover
+            fingerprint = _fingerprint(path)
+            if archived.get(path.name) == fingerprint:
+                continue
+            member_files.append((path.relative_to(output_dir).as_posix(), path))
+            archived[path.name] = fingerprint
+            changed = True
+    return state, changed
+
+
+# --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
 def _result_dirs(device_dir: Path) -> list[Path]:
@@ -213,18 +300,33 @@ def _result_is_empty(results_dir: Path) -> bool:
     return not _load_results(results_dir).get("tracks") and not _result_has_media(results_dir)
 
 
+def _fingerprint(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()
+
+
 def _load_archived_state(results_dir: Path) -> dict:
-    path = results_dir / ARCHIVED_STATE_FILENAME
+    return _load_json(results_dir / ARCHIVED_STATE_FILENAME, {"track_ids": [], "files": []})
+
+
+def _save_archived_state(results_dir: Path, state: dict) -> None:
+    (results_dir / ARCHIVED_STATE_FILENAME).write_text(json.dumps(state), encoding="utf-8")
+
+
+def _load_aux_state(device_dir: Path) -> dict:
+    return _load_json(device_dir / AUX_STATE_FILENAME, {})
+
+
+def _save_aux_state(device_dir: Path, state: dict) -> None:
+    (device_dir / AUX_STATE_FILENAME).write_text(json.dumps(state), encoding="utf-8")
+
+
+def _load_json(path: Path, default: dict) -> dict:
     if path.exists():
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             pass
-    return {"track_ids": [], "files": []}
-
-
-def _save_archived_state(results_dir: Path, state: dict) -> None:
-    (results_dir / ARCHIVED_STATE_FILENAME).write_text(json.dumps(state), encoding="utf-8")
+    return default
 
 
 def _ship_tar(

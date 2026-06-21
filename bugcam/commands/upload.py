@@ -263,8 +263,21 @@ def upload_ready_results(
     dot_ids: list[str],
     delete_after_upload: bool,
     manifest_uploaded: bool,
+    archive_mode: bool = False,
 ) -> tuple[int, bool]:
-    """Upload all ready result directories once."""
+    """Upload all ready result directories once.
+
+    When ``archive_mode`` is set the hourly tar archiver owns shipping of
+    results, heartbeats, environment, and logs, so this path does nothing but
+    the manifest -- which stays live because the backend reads it at the fixed
+    key ``v1/manifest.json``.
+    """
+    if archive_mode:
+        if not manifest_uploaded and _list_result_directories(output_dir):
+            upload_manifest(api_url, api_key, flick_id, dot_ids)
+            manifest_uploaded = True
+        return 0, manifest_uploaded
+
     processed_count = _upload_heartbeat_files(output_dir, api_url, api_key)
     processed_count += _upload_environment_files(output_dir, api_url, api_key)
     processed_count += _upload_log_files(output_dir, api_url, api_key)
@@ -304,6 +317,7 @@ def watch_uploads(
     poll_interval: int,
     delete_after_upload: bool,
     stop_event: threading.Event,
+    archive_mode: bool = False,
 ) -> None:
     """Poll an output directory and upload ready results."""
     manifest_uploaded = False
@@ -318,6 +332,7 @@ def watch_uploads(
                 dot_ids,
                 delete_after_upload,
                 manifest_uploaded,
+                archive_mode,
             )
             consecutive_failures = 0
             stop_event.wait(poll_interval)

@@ -26,7 +26,8 @@ so this whole file is RED until the archiver lands.
 """
 import json
 import tarfile
-from datetime import datetime
+import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from bugcam.commands import archive
@@ -277,3 +278,110 @@ class TestSelfContainment:
         _run(out)
 
         assert captured == []
+
+
+# --------------------------------------------------------------------------- #
+# aux artifacts: heartbeats + environment + logs ride in the device tar
+# (manifest is deliberately NOT batched -- backend reads it at a fixed key)
+# --------------------------------------------------------------------------- #
+def _make_aux(out: Path, device: str, kind: str, name: str, content: str = "{}") -> Path:
+    aux_dir = out / device / kind
+    aux_dir.mkdir(parents=True, exist_ok=True)
+    path = aux_dir / name
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+class TestAuxArtifacts:
+    def test_heartbeats_bundled_even_without_results(self, tmp_path, mocker):
+        out = tmp_path / "out"
+        _make_aux(out, "flick1", "heartbeats", "hb_120000.json", '{"t": 1}')
+        captured = _capture_uploads(mocker)
+
+        _run(out)
+
+        assert len(captured) == 1
+        assert "flick1/heartbeats/hb_120000.json" in captured[0]["members"]
+
+    def test_environment_bundled(self, tmp_path, mocker):
+        out = tmp_path / "out"
+        _make_aux(out, "flick1", "environment", "env_120000.json", '{"c": 20}')
+        captured = _capture_uploads(mocker)
+
+        _run(out)
+
+        assert "flick1/environment/env_120000.json" in captured[0]["members"]
+
+    def test_aux_shipped_once(self, tmp_path, mocker):
+        out = tmp_path / "out"
+        _make_aux(out, "flick1", "heartbeats", "hb_120000.json", '{"t": 1}')
+        mocker.patch.object(archive, "upload_file")  # seed run
+        _run(out)
+        captured = _capture_uploads(mocker)
+
+        _run(out, now=datetime(2026, 2, 4, 14, 0, 0))  # nothing new
+
+        assert captured == []
+
+    def test_completed_day_log_bundled_today_skipped(self, tmp_path, mocker):
+        out = tmp_path / "out"
+        today = datetime.now().strftime("%Y%m%d")
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        _make_aux(out, "flick1", "logs", f"edge26_{yesterday}.log", "done day\n")
+        _make_aux(out, "flick1", "logs", f"edge26_{today}.log", "still writing\n")
+        captured = _capture_uploads(mocker)
+
+        _run(out, now=datetime.now())
+
+        members = captured[0]["members"]
+        assert f"flick1/logs/edge26_{yesterday}.log" in members
+        assert f"flick1/logs/edge26_{today}.log" not in members  # active log left out
+
+    def test_aux_rides_with_result_units(self, tmp_path, mocker):
+        out = tmp_path / "out"
+        _make_flik_dir(out, "flick1", "20260204_120000", ["t1"])
+        _make_aux(out, "flick1", "heartbeats", "hb_120000.json", '{"t": 1}')
+        captured = _capture_uploads(mocker)
+
+        _run(out)
+
+        # one tar for the device, carrying both the result unit and the heartbeat
+        assert len(captured) == 1
+        members = captured[0]["members"]
+        assert "flick1/20260204_120000/results.json" in members
+        assert "flick1/heartbeats/hb_120000.json" in members
+
+    def test_aux_state_not_bundled(self, tmp_path, mocker):
+        out = tmp_path / "out"
+        _make_aux(out, "flick1", "heartbeats", "hb_120000.json", '{"t": 1}')
+        captured = _capture_uploads(mocker)
+
+        _run(out)
+
+        assert not any(name.endswith(".archived-aux") for name in captured[0]["members"])
+
+
+# --------------------------------------------------------------------------- #
+# hourly cadence loop
+# --------------------------------------------------------------------------- #
+class TestWatchArchives:
+    def test_builds_then_stops(self, tmp_path, mocker):
+        out = tmp_path / "out"
+        out.mkdir()
+        stop = threading.Event()
+        build = mocker.patch.object(archive, "build_archives", side_effect=lambda *a, **k: stop.set())
+
+        t = threading.Thread(
+            target=archive.watch_archives,
+            args=(out, "http://api", "k", "flick1", ["dot1"], 3600, stop),
+            daemon=True,
+        )
+        t.start()
+        t.join(5.0)
+
+        assert not t.is_alive()
+        build.assert_called()
+        called = build.call_args
+        assert called.args[0] == out
+        assert called.args[1] == "flick1"
+        assert called.args[2] == ["dot1"]
