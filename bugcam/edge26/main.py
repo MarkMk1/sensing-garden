@@ -61,6 +61,7 @@ class Pipeline:
         config: dict,
         *,
         detection_child: bool = False,
+        classification_child: bool = False,
         shared_video_queue=None,
         shared_stop_event=None,
         shared_recording_stopped=None,
@@ -84,9 +85,27 @@ class Pipeline:
             self.enable_recording = False
             self.enable_classification = False
             self.enable_processing = True
+
+        # Run the classification loop in its own subprocess for the same reason:
+        # Hailo inference via the InferVStreams API holds the GIL for the whole
+        # call, which starves picamera2's frame-servicing threads in the
+        # recorder's process and silently drops frames. The child is a
+        # classification-only Pipeline; its work arrives via the disk-based
+        # classification queue and its outputs (results.json, .done markers,
+        # composites) are disk writes, so the only shared primitive is a stop
+        # event.
+        self.classification_in_subprocess = pipeline_config.get("classification_in_subprocess", False)
+        self._classification_child = classification_child
+        if self._classification_child:
+            # The classification child never records or runs detection.
+            self.enable_recording = False
+            self.enable_processing = True
+            self.enable_classification = True
         # This instance runs the detection loop (and owns the tracker-reset
         # markers) when monolithic, or when it is the detection child.
-        self._owns_detection = (not self.detection_in_subprocess) or self._detection_child
+        self._owns_detection = (
+            (not self.detection_in_subprocess) or self._detection_child
+        ) and not self._classification_child
 
         # Coordination primitives. In subprocess mode the recorder (parent) and
         # detection loop (child) live in different processes, so the queue and
@@ -102,10 +121,24 @@ class Pipeline:
             self.stop_event = threading.Event()
             self.recording_stopped = threading.Event()
 
+        # The classification child stops on the event its parent hands it; that
+        # event replaces whatever primitive the branches above picked. The
+        # parent creates the event here (not in start()) so stop() can signal
+        # the child even if start() was never reached.
+        self._cls_stop_event = None
+        if self._classification_child:
+            if shared_stop_event is None:
+                raise ValueError("classification_child requires shared_stop_event")
+            self.stop_event = shared_stop_event
+        elif self.enable_classification and self.classification_in_subprocess:
+            self._cls_ctx = self._mp_ctx or mp.get_context("spawn")
+            self._cls_stop_event = self._cls_ctx.Event()
+
         self.recorder_thread = None
         self.detection_thread = None
         self.detection_process = None
         self.classification_thread = None
+        self.classification_process = None
         
         # Device config
         device_config = config.get("device", {})
@@ -146,8 +179,13 @@ class Pipeline:
         self.processor = VideoProcessor(config) if self.enable_processing else None
         self.writer = ResultsWriter(config["output"]) if self.enable_processing else None
         
-        # Eagerly initialize classifier for the classification thread
-        if self.enable_classification and self.processor:
+        # Eagerly initialize classifier for the classification worker. When the
+        # worker runs in a subprocess, the child owns the Hailo device and the
+        # parent must not touch it.
+        runs_classification_here = (
+            self._classification_child or not self.classification_in_subprocess
+        )
+        if self.enable_classification and self.processor and runs_classification_here:
             self.processor._classifier = HailoClassifier(self.processor.classification_config)
             logger.info("Hailo classifier initialized")
         
@@ -1179,15 +1217,28 @@ class Pipeline:
                 self.detection_thread.start()
                 logger.info("Detection thread started")
             
-            # Start classification worker
+            # Start classification worker — an in-process thread, or a dedicated
+            # subprocess (separate interpreter/GIL) when
+            # classification_in_subprocess is enabled, so Hailo inference (which
+            # holds the GIL for the whole call) can't starve the recorder threads.
             if self.enable_classification:
-                self.classification_thread = threading.Thread(
-                    target=self._classification_worker,
-                    daemon=False,
-                    name="Classification"
-                )
-                self.classification_thread.start()
-                logger.info("Classification thread started")
+                if self.classification_in_subprocess and not self._classification_child:
+                    self.classification_process = self._cls_ctx.Process(
+                        target=_classification_subprocess_entry,
+                        args=(self.config, self._cls_stop_event),
+                        name="ClassificationProcess",
+                        daemon=False,
+                    )
+                    self.classification_process.start()
+                    logger.info(f"Classification subprocess started (pid={self.classification_process.pid})")
+                else:
+                    self.classification_thread = threading.Thread(
+                        target=self._classification_worker,
+                        daemon=False,
+                        name="Classification"
+                    )
+                    self.classification_thread.start()
+                    logger.info("Classification thread started")
         
         if self.enable_recording and self.enable_processing:
             logger.info("Pipeline running - Ctrl+C to stop recording (processing continues)")
@@ -1231,9 +1282,11 @@ class Pipeline:
         # Stop recorder first
         self.stop_recording()
         
-        # Stop threads / detection subprocess
+        # Stop threads / worker subprocesses
         self.stop_event.set()
-        
+        if self._cls_stop_event is not None:
+            self._cls_stop_event.set()
+
         if self.detection_process:
             self.detection_process.join(timeout=30.0)
             if self.detection_process.is_alive():
@@ -1241,15 +1294,23 @@ class Pipeline:
                 self.detection_process.terminate()
                 self.detection_process.join(timeout=5.0)
             logger.info("Detection subprocess stopped")
-        
+
         if self.detection_thread:
             self.detection_thread.join(timeout=30.0)
             logger.info("Detection thread stopped")
-        
+
+        if self.classification_process:
+            self.classification_process.join(timeout=30.0)
+            if self.classification_process.is_alive():
+                logger.warning("Classification subprocess did not exit in time; terminating")
+                self.classification_process.terminate()
+                self.classification_process.join(timeout=5.0)
+            logger.info("Classification subprocess stopped")
+
         if self.classification_thread:
             self.classification_thread.join(timeout=30.0)
             logger.info("Classification thread stopped")
-        
+
         logger.info("Pipeline stopped cleanly")
     
     def wait(self) -> None:
@@ -1265,7 +1326,16 @@ class Pipeline:
         # Wait for detection thread to finish (if running)
         if self.detection_thread:
             self.detection_thread.join()
-        
+
+        # The classification child only exits on its stop event. Detection
+        # finishing normally means the classification queue is drained (its
+        # exit condition requires pending == 0), so it is safe to signal the
+        # child once detection is done; on a hard stop the event is already set.
+        if self.classification_process:
+            if self._cls_stop_event is not None:
+                self._cls_stop_event.set()
+            self.classification_process.join()
+
         # Wait for classification thread to finish (if running)
         if self.classification_thread:
             self.classification_thread.join()
@@ -1297,3 +1367,31 @@ def _detection_subprocess_entry(config, video_queue, stop_event, recording_stopp
         detector._detection_worker()
     finally:
         logger.info("Detection subprocess exiting")
+
+
+def _classification_subprocess_entry(config, stop_event):
+    """Spawned-subprocess entrypoint for the classification loop.
+
+    Runs in its own interpreter (own GIL) so Hailo inference — which holds the
+    GIL for the entire call in the InferVStreams API — cannot starve picamera2's
+    frame-servicing threads in the recorder's process (dropped-frame fix, same
+    pattern as the detection subprocess). The child owns the Hailo device; the
+    parent never initializes it. Work arrives through the disk-based
+    classification queue and all outputs (results.json, .done markers,
+    composites) are disk writes, exactly as in the in-process path, so
+    classification results are unchanged.
+    """
+    try:
+        setup_logging(Path(config["paths"]["logs_dir"]))
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+    logger.info("Classification subprocess starting")
+    classifier = Pipeline(
+        config,
+        classification_child=True,
+        shared_stop_event=stop_event,
+    )
+    try:
+        classifier._classification_worker()
+    finally:
+        logger.info("Classification subprocess exiting")

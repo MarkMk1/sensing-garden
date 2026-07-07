@@ -234,6 +234,11 @@ def run(
         "--detection-in-subprocess/--detection-in-thread",
         help="Run detection in a separate process (own GIL) so it can't starve the recorder threads (default: on)",
     ),
+    classification_in_subprocess: bool = typer.Option(
+        True,
+        "--classification-in-subprocess/--classification-in-thread",
+        help="Run classification in a separate process (own GIL) so Hailo inference can't starve the recorder threads (default: on)",
+    ),
     enable_upload: bool = typer.Option(
         True,
         "--upload/--no-upload",
@@ -278,6 +283,7 @@ def run(
             resolution=parsed_resolution,
             bitrate=bitrate,
             detection_in_subprocess=detection_in_subprocess,
+            classification_in_subprocess=classification_in_subprocess,
             detection_config_path=detection_config,
         )
         upload_stop_event = threading.Event()

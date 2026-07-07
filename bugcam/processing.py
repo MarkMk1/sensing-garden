@@ -182,6 +182,7 @@ def build_edge26_config(
     enable_classification: bool = True,
     continuous_tracking: bool = False,
     detection_in_subprocess: bool = True,
+    classification_in_subprocess: bool = True,
     model_metadata: dict[str, Any] | None = None,
     detection_config_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -220,6 +221,7 @@ def build_edge26_config(
             "enable_classification": enable_classification,
             "continuous_tracking": continuous_tracking,
             "detection_in_subprocess": detection_in_subprocess,
+            "classification_in_subprocess": classification_in_subprocess,
             "recording_mode": recording_mode,
             "recording_interval_minutes": recording_interval,
         },
