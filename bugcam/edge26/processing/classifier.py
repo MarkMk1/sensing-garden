@@ -2,9 +2,11 @@
 Hierarchical insect classification.
 
 Classifies insects at 3 levels: Family, Genus, Species.
-Uses Hailo HEF models for inference via the VStreams API.
+Uses Hailo HEF models for inference via the InferModel (async) API.
 Taxonomy (family/genus) is resolved from GBIF at startup.
 """
+
+from __future__ import annotations
 
 import logging
 import json
@@ -19,21 +21,17 @@ import requests
 try:
     from hailo_platform import (
         HEF,
-        ConfigureParams,
         FormatType,
         HailoSchedulingAlgorithm,
-        HailoStreamInterface,
-        InferVStreams,
-        InputVStreamParams,
-        OutputVStreamParams,
         VDevice,
     )
-except ImportError as e:
-    raise ImportError(
-        "hailo_platform module not found. This is a system-level dependency for Hailo AI accelerators. "
-        "On Raspberry Pi OS, install it with: sudo apt install python3-hailo-tappas. "
-        "For other platforms, follow Hailo's installation guide: https://hailo.ai/developer-zone/"
-    ) from e
+    _HAILO_IMPORT_ERROR: ImportError | None = None
+except ImportError as e:  # hailo_platform is a Pi-only hardware dependency
+    # Defer the failure: keep the module importable (so `bugcam --help`, the test
+    # suite, and any non-inference code path work off-Pi) and raise only when the
+    # classifier actually loads a model. See _load_model.
+    HEF = FormatType = HailoSchedulingAlgorithm = VDevice = None
+    _HAILO_IMPORT_ERROR = e
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +218,12 @@ class HailoClassifier:
     """
     Hailo-based hierarchical insect classifier.
 
-    Uses the VStreams API to run inference on a compiled HEF model.
+    Uses the InferModel (async) API to run inference on a compiled HEF model.
+    Unlike the legacy InferVStreams API — whose Python binding holds the GIL
+    for the entire inference call — run_async/wait release the GIL while the
+    NPU works, so classification cannot starve other Python threads (e.g.
+    picamera2's frame servicing). The model is also configured once and kept
+    configured, instead of rebuilding the vstream pipeline per crop.
     Outputs predictions for family, genus, and species.
     """
 
@@ -232,10 +235,11 @@ class HailoClassifier:
         # Hailo components (lazy-loaded on first inference)
         self._hef: Optional[HEF] = None
         self._vdevice: Optional[VDevice] = None
-        self._network_group = None
-        self._network_group_params = None
-        self._input_vstream_params = None
-        self._output_vstream_params = None
+        self._infer_model = None
+        self._configured_model = None
+        self._input_name: Optional[str] = None
+        self._output_names: List[str] = []
+        self._output_shapes: Dict[str, tuple] = {}
 
         # Labels & taxonomy (populated by _load_labels)
         self.family_list: List[str] = []
@@ -252,35 +256,49 @@ class HailoClassifier:
 
     def _load_model(self) -> None:
         """Load the HEF, configure the device, and build the taxonomy."""
+        if _HAILO_IMPORT_ERROR is not None:
+            raise ImportError(
+                "hailo_platform module not found. This is a system-level dependency for Hailo AI accelerators. "
+                "On Raspberry Pi OS, install it with: sudo apt install python3-hailo-tappas. "
+                "For other platforms, follow Hailo's installation guide: https://hailo.ai/developer-zone/"
+            ) from _HAILO_IMPORT_ERROR
         if self._hef is not None:
             return
 
         if not self.model_path.exists():
             raise FileNotFoundError(f"Model not found: {self.model_path}")
 
-        # Load HEF
+        # Load HEF (kept for output ordering and the labels fallback)
         self._hef = HEF(str(self.model_path))
 
-        # Create virtual device
+        # Create virtual device. The InferModel API requires the scheduler
+        # (explicit activate/deactivate is the legacy path).
         params = VDevice.create_params()
-        params.scheduling_algorithm = HailoSchedulingAlgorithm.NONE
+        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
         self._vdevice = VDevice(params=params)
 
-        # Configure network group
-        configure_params = ConfigureParams.create_from_hef(
-            hef=self._hef, interface=HailoStreamInterface.PCIe,
-        )
-        network_groups = self._vdevice.configure(self._hef, configure_params)
-        self._network_group = network_groups[0]
-        self._network_group_params = self._network_group.create_params()
+        # Build and configure the infer model once; it stays configured for
+        # the classifier's lifetime (the legacy code rebuilt the vstream
+        # pipeline and re-activated the network group on every single crop).
+        self._infer_model = self._vdevice.create_infer_model(str(self.model_path))
 
-        # VStream params – dequantised float32 in/out
-        self._input_vstream_params = InputVStreamParams.make(
-            self._network_group, quantized=False, format_type=FormatType.FLOAT32,
-        )
-        self._output_vstream_params = OutputVStreamParams.make(
-            self._network_group, quantized=False, format_type=FormatType.FLOAT32,
-        )
+        # Dequantised float32 in/out, matching the legacy vstream params.
+        for stream in self._infer_model.inputs:
+            stream.set_format_type(FormatType.FLOAT32)
+        for stream in self._infer_model.outputs:
+            stream.set_format_type(FormatType.FLOAT32)
+
+        self._input_name = self._infer_model.input_names[0]
+
+        # _parse_outputs relies on hef output ordering (family, genus, species);
+        # index InferModel outputs by those same names.
+        self._output_names = [info.name for info in self._hef.get_output_vstream_infos()]
+        self._output_shapes = {
+            name: tuple(self._infer_model.output(name).shape)
+            for name in self._output_names
+        }
+
+        self._configured_model = self._infer_model.configure()
 
         # Labels & taxonomy
         self._load_labels()
@@ -468,24 +486,30 @@ class HailoClassifier:
         shape = self._hef.get_input_vstream_infos()[0].shape  # (H, W, C)
         return int(shape[0]), int(shape[1])
 
+    # Generous per-frame ceiling; a single classification takes milliseconds,
+    # so hitting this means the device is genuinely stuck, not slow.
+    _INFERENCE_TIMEOUT_MS = 10_000
+
     def _run_inference(self, preprocessed: np.ndarray) -> List[np.ndarray]:
-        """Run a single forward pass through the Hailo VStreams pipeline."""
-        input_info = self._hef.get_input_vstream_infos()[0]
-        output_infos = self._hef.get_output_vstream_infos()
+        """Run a single forward pass through the configured infer model.
 
-        # Batch dimension required by InferVStreams
-        input_data = {input_info.name: np.expand_dims(preprocessed, axis=0)}
+        run() is run_async + wait under the hood; both release the GIL while
+        the NPU works, so other Python threads keep running during inference.
+        """
+        bindings = self._configured_model.create_bindings()
+        bindings.input(self._input_name).set_buffer(
+            np.ascontiguousarray(preprocessed, dtype=np.float32)
+        )
 
-        with InferVStreams(
-            self._network_group,
-            self._input_vstream_params,
-            self._output_vstream_params,
-        ) as pipeline:
-            with self._network_group.activate(self._network_group_params):
-                results = pipeline.infer(input_data)
+        outputs = {}
+        for name in self._output_names:
+            buf = np.empty(self._output_shapes[name], dtype=np.float32)
+            bindings.output(name).set_buffer(buf)
+            outputs[name] = buf
 
-        # Strip batch dimension and ensure float32
-        return [results[info.name][0].astype(np.float32) for info in output_infos]
+        self._configured_model.run([bindings], self._INFERENCE_TIMEOUT_MS)
+
+        return [outputs[name] for name in self._output_names]
 
     def _parse_outputs(
         self, outputs: List[np.ndarray],
