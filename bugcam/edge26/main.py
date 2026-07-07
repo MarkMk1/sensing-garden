@@ -88,10 +88,21 @@ class Pipeline:
         # markers) when monolithic, or when it is the detection child.
         self._owns_detection = (not self.detection_in_subprocess) or self._detection_child
 
-        # Coordination primitives. In subprocess mode the recorder (parent) and
-        # detection loop (child) live in different processes, so the queue and
-        # events must be multiprocessing-backed and shared between them.
-        if self.detection_in_subprocess:
+        # Run the camera capture/encode loop in its own subprocess. The camera
+        # is the only hard-realtime component: picamera2 services each frame
+        # through Python threads (CameraManager.listen, NullPreview) that must
+        # win the GIL within the frame period or libcamera silently drops the
+        # frame. Any GIL-holding work in the same process — Hailo inference via
+        # InferVStreams holds the GIL for the entire call — starves them (~half
+        # the frames lost at 4K/14fps). Isolating the recorder gives capture
+        # its own interpreter so no present or future parent-side work can
+        # touch it.
+        self.recording_in_subprocess = pipeline_config.get("recording_in_subprocess", False)
+
+        # Coordination primitives. In subprocess mode workers live in different
+        # processes, so the queue and events must be multiprocessing-backed and
+        # shared between them.
+        if self.detection_in_subprocess or (self.enable_recording and self.recording_in_subprocess):
             self._mp_ctx = mp.get_context("spawn")
             self.video_queue = shared_video_queue or self._mp_ctx.JoinableQueue()
             self.stop_event = shared_stop_event or self._mp_ctx.Event()
@@ -102,7 +113,19 @@ class Pipeline:
             self.stop_event = threading.Event()
             self.recording_stopped = threading.Event()
 
+        # Recorder-subprocess IPC: a stop signal in, and the final chunk path
+        # back out (for the tracker-reset marker). Created here (not in
+        # start()) so stop_recording() can signal the child even if start()
+        # was interrupted.
+        self._rec_stop_event = None
+        self._rec_last_chunk_queue = None
+        if self.enable_recording and self.recording_in_subprocess:
+            self._rec_stop_event = self._mp_ctx.Event()
+            self._rec_last_chunk_queue = self._mp_ctx.Queue()
+        self._last_chunk_from_child = None
+
         self.recorder_thread = None
+        self.recorder_process = None
         self.detection_thread = None
         self.detection_process = None
         self.classification_thread = None
@@ -141,8 +164,11 @@ class Pipeline:
         if self.continuous_tracking and self._owns_detection:
             self._load_last_recording_marker()
         
-        # Initialize components based on mode
-        self.recorder = self._init_recorder() if self.enable_recording else None
+        # Initialize components based on mode. In subprocess mode the child
+        # builds its own VideoRecorder (and opens the camera); the parent must
+        # not construct one.
+        build_recorder_here = self.enable_recording and not self.recording_in_subprocess
+        self.recorder = self._init_recorder() if build_recorder_here else None
         self.processor = VideoProcessor(config) if self.enable_processing else None
         self.writer = ResultsWriter(config["output"]) if self.enable_processing else None
         
@@ -180,24 +206,7 @@ class Pipeline:
     
     def _init_recorder(self) -> VideoRecorder:
         """Initialize video recorder from config."""
-        paths = self.config["paths"]
-        capture = self.config["capture"]
-        pipeline_cfg = self.config.get("pipeline", {})
-        
-        return VideoRecorder(
-            output_dir=paths["input_storage"],
-            fps=capture["fps"],
-            chunk_duration=capture["chunk_duration_seconds"],
-            resolution=tuple(capture.get("resolution", [1080, 1080])),
-            device_id=self.flick_id,
-            video_queue=self.video_queue,
-            camera_index=capture["camera_index"],
-            use_picamera=capture["use_picamera"],
-            recording_mode=pipeline_cfg.get("recording_mode", "continuous"),
-            interval_minutes=pipeline_cfg.get("recording_interval_minutes", 5),
-            bitrate=capture.get("bitrate", 20_000_000),
-            exposure_time=capture.get("exposure_time"),
-        )
+        return _build_recorder(self.config, self.video_queue)
     
     def _is_flick_video(self, path: Path) -> bool:
         """Check if a path is a FLICK video (matches flick_id prefix)."""
@@ -390,11 +399,12 @@ class Pipeline:
     
     def _save_last_recording_marker(self) -> None:
         """Write the .last_recording marker when recording stops."""
-        if not (self.continuous_tracking and self.recorder
-                and self.recorder.last_chunk_path):
+        last_chunk = (self.recorder.last_chunk_path if self.recorder
+                      else self._last_chunk_from_child)
+        if not (self.continuous_tracking and last_chunk):
             return
-        
-        filename = self.recorder.last_chunk_path.name
+
+        filename = last_chunk.name
         self._marker_path.write_text(filename)
         self._reset_after_video = filename
         logger.info(f"Marked last recording: {filename}")
@@ -1144,8 +1154,21 @@ class Pipeline:
         logger.info("STARTING PIPELINE")
         logger.info("=" * 60)
         
-        # Start recorder (if enabled)
-        if self.enable_recording and self.recorder:
+        # Start recorder (if enabled) — a dedicated subprocess (own
+        # interpreter/GIL) when recording_in_subprocess is enabled, so no
+        # parent-side Python work can starve picamera2's frame-servicing
+        # threads; otherwise the in-process thread.
+        if self.enable_recording and self.recording_in_subprocess:
+            self.recorder_process = self._mp_ctx.Process(
+                target=_recorder_subprocess_entry,
+                args=(self.config, self.video_queue,
+                      self._rec_stop_event, self._rec_last_chunk_queue),
+                name="RecorderProcess",
+                daemon=False,
+            )
+            self.recorder_process.start()
+            logger.info(f"Recorder subprocess started (pid={self.recorder_process.pid})")
+        elif self.enable_recording and self.recorder:
             self.recorder_thread = threading.Thread(
                 target=self.recorder.start,
                 daemon=True,
@@ -1203,11 +1226,26 @@ class Pipeline:
             logger.info("STOPPING RECORDING")
             logger.info("=" * 60)
             
+            if self.recorder_process:
+                self._rec_stop_event.set()
+                # The child finalizes the in-flight chunk (stop + remux) before
+                # reporting its last chunk path back; a 4K remux can take a few
+                # seconds, hence the generous timeout.
+                try:
+                    last = self._rec_last_chunk_queue.get(timeout=30.0)
+                    self._last_chunk_from_child = Path(last) if last else None
+                except queue.Empty:
+                    logger.warning("Recorder subprocess did not report its last chunk in time")
+                self.recorder_process.join(timeout=10.0)
+                if self.recorder_process.is_alive():
+                    logger.warning("Recorder subprocess did not exit in time; terminating")
+                    self.recorder_process.terminate()
+                    self.recorder_process.join(timeout=5.0)
             if self.recorder:
                 self.recorder.stop()
             if self.recorder_thread:
                 self.recorder_thread.join(timeout=10.0)
-            
+
             # Mark the last recorded video so tracker resets after it
             self._save_last_recording_marker()
             
@@ -1257,6 +1295,11 @@ class Pipeline:
         # Wait for recorder to finish (if running)
         if self.recorder_thread:
             self.recorder_thread.join()
+
+        # Wait for recorder subprocess to finish (if running). It exits once
+        # stop_recording() signals it and it finalizes the in-flight chunk.
+        if self.recorder_process:
+            self.recorder_process.join()
         
         # Wait for detection subprocess to finish (if running)
         if self.detection_process:
@@ -1297,3 +1340,64 @@ def _detection_subprocess_entry(config, video_queue, stop_event, recording_stopp
         detector._detection_worker()
     finally:
         logger.info("Detection subprocess exiting")
+
+
+def _build_recorder(config, video_queue) -> VideoRecorder:
+    """Build a VideoRecorder from the pipeline config (shared by the in-process
+    path and the recorder subprocess, so both construct it identically)."""
+    paths = config["paths"]
+    capture = config["capture"]
+    pipeline_cfg = config.get("pipeline", {})
+    device_cfg = config.get("device", {})
+
+    return VideoRecorder(
+        output_dir=paths["input_storage"],
+        fps=capture["fps"],
+        chunk_duration=capture["chunk_duration_seconds"],
+        resolution=tuple(capture.get("resolution", [1080, 1080])),
+        device_id=device_cfg.get("flick_id", "edge26"),
+        video_queue=video_queue,
+        camera_index=capture["camera_index"],
+        use_picamera=capture["use_picamera"],
+        recording_mode=pipeline_cfg.get("recording_mode", "continuous"),
+        interval_minutes=pipeline_cfg.get("recording_interval_minutes", 5),
+        bitrate=capture.get("bitrate", 20_000_000),
+        exposure_time=capture.get("exposure_time"),
+    )
+
+
+def _recorder_subprocess_entry(config, video_queue, stop_event, last_chunk_queue):
+    """Spawned-subprocess entrypoint for the camera capture/encode loop.
+
+    Runs in its own interpreter (own GIL) so no Python work in the parent —
+    Hailo inference via InferVStreams (which holds the GIL for the entire
+    call), upload traffic, anything added later — can starve picamera2's
+    frame-servicing threads (CameraManager.listen / NullPreview). Those threads
+    must win the GIL within each frame period to return buffers to libcamera;
+    when they can't, frames are silently dropped (~half lost at 4K/14fps).
+
+    The recorder pushes completed chunk paths onto the shared video queue
+    exactly as the in-process thread did. The only extra IPC is the stop event
+    in, and the final chunk path out (for the tracker-reset marker).
+    """
+    try:
+        setup_logging(Path(config["paths"]["logs_dir"]))
+    except Exception:
+        logging.basicConfig(level=logging.INFO)
+    logger.info("Recorder subprocess starting")
+
+    recorder = _build_recorder(config, video_queue)
+
+    # Relay the parent's stop signal to the recorder's own stop mechanism.
+    threading.Thread(
+        target=lambda: (stop_event.wait(), recorder.stop()),
+        daemon=True,
+        name="RecorderStopRelay",
+    ).start()
+
+    try:
+        recorder.start()  # blocks until stopped
+    finally:
+        last = recorder.last_chunk_path
+        last_chunk_queue.put(str(last) if last else None)
+        logger.info("Recorder subprocess exiting")

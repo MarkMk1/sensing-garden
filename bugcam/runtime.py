@@ -42,6 +42,7 @@ def build_pipeline(
     enable_classification: bool = True,
     continuous_tracking: bool = False,
     detection_in_subprocess: bool = True,
+    recording_in_subprocess: bool = True,
     detection_config_path: Path | None = None,
 ) -> Pipeline:
     """Create a configured edge26 pipeline instance."""
@@ -65,6 +66,7 @@ def build_pipeline(
         enable_classification=enable_classification,
         continuous_tracking=continuous_tracking,
         detection_in_subprocess=detection_in_subprocess,
+        recording_in_subprocess=recording_in_subprocess,
         model_metadata=provenance,
         detection_config_path=detection_config_path,
     )

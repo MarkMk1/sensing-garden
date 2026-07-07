@@ -234,6 +234,11 @@ def run(
         "--detection-in-subprocess/--detection-in-thread",
         help="Run detection in a separate process (own GIL) so it can't starve the recorder threads (default: on)",
     ),
+    recording_in_subprocess: bool = typer.Option(
+        True,
+        "--recording-in-subprocess/--recording-in-thread",
+        help="Run the camera capture/encode loop in a separate process (own GIL) so no other work can starve it into dropping frames (default: on)",
+    ),
     enable_upload: bool = typer.Option(
         True,
         "--upload/--no-upload",
@@ -278,6 +283,7 @@ def run(
             resolution=parsed_resolution,
             bitrate=bitrate,
             detection_in_subprocess=detection_in_subprocess,
+            recording_in_subprocess=recording_in_subprocess,
             detection_config_path=detection_config,
         )
         upload_stop_event = threading.Event()
