@@ -56,8 +56,14 @@ def _heartbeat_loop(
         if pollen is not None:
             # Heartbeats are telemetry, not durable artifacts; shipped through the
             # spooler for now, though file-vs-real-time-POST delivery is still open.
-            pollen.enqueue_set([path], device=flick_id, kind="heartbeat")  # staged; our copy is done
-            path.unlink(missing_ok=True)
+            # This loop has no outer supervisor -- an uncaught exception here kills
+            # the daemon thread permanently (heartbeats silently stop for the rest of
+            # the run), so every enqueue is guarded and logged rather than left bare.
+            try:
+                pollen.enqueue_set([path], device=flick_id, kind="heartbeat")  # staged; our copy is done
+                path.unlink(missing_ok=True)
+            except Exception:
+                logger.exception("heartbeat enqueue failed (will retry next interval): %s", path.name)
         stop_event.wait(interval)
 
 
@@ -78,6 +84,10 @@ def _environment_loop(
         except Exception as exc:
             if not warning_emitted:
                 console.print(f"[yellow]Environment sensor warning[/yellow] {exc}")
+                # console.print alone never reaches the persisted daily log file
+                # (it writes straight to the terminal, bypassing logging) -- mirror
+                # it through the logger so a later log inspection can see this.
+                logger.warning("environment sensor/enqueue warning: %s: %s", type(exc).__name__, exc)
                 warning_emitted = True
         stop_event.wait(ENVIRONMENT_INTERVAL_SECONDS)
 
@@ -321,6 +331,14 @@ def run(
                 delete_after_upload=delete_after_upload,
             )
             console.print(f"[dim]Upload[/dim] enabled (batch={pollen_settings['batch']})")
+            # console.print is invisible to the persisted daily log (it writes straight
+            # to the terminal, bypassing the logging module) -- log it too so a later
+            # inspection of edge26_YYYYMMDD.log can confirm uploads were actually wired
+            # for this run, instead of having to infer it from silence.
+            logger.info(
+                "upload enabled (batch=%s, poll_interval=%s, videos_per_tick=%s)",
+                pollen_settings["batch"], pollen_settings["poll_interval"], pollen_settings["videos_per_tick"],
+            )
 
             # The manifest is a fixed-key object the queue does not own; ship it once
             # at startup. A missing manifest is non-fatal -- the backend resolves
@@ -335,8 +353,10 @@ def run(
                 pollen_instance.upload_now(manifest, "v1/manifest.json", "application/json")
             except Exception as exc:  # noqa: BLE001
                 console.print(f"[yellow]Manifest upload failed[/yellow] {exc} (non-fatal)")
+                logger.warning("manifest upload failed (non-fatal): %s: %s", type(exc).__name__, exc)
         else:
             console.print("[yellow]Uploads disabled[/yellow] (--no-upload)")
+            logger.warning("uploads disabled for this run (--no-upload) -- no artifact will reach S3")
 
         selected_model = select_model_reference(model)
         provenance = resolve_bundle_provenance(selected_model)
