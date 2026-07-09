@@ -9,6 +9,11 @@ finished path to ``on_complete``. ``ship_existing_logs`` enqueues any already-co
 
 The upload subsystem never scans for logs; it only receives what this pushes -- one
 enqueue per completed file, at the moment it completes.
+
+Independent of shipping, ``DailyLogHandler`` also caps how many daily log files sit on
+disk (``backlog``, default ``DEFAULT_BACKLOG``): whenever uploads are disabled, or a
+shipped file's on-disk copy survives (upload failure, no delete-after-ship), old logs
+would otherwise accumulate forever. Pruning runs at startup and on every rollover.
 """
 from __future__ import annotations
 
@@ -19,10 +24,20 @@ from typing import Callable, Optional
 
 LOG_PREFIX = "edge26_"
 LOG_SUFFIX = ".log"
+DEFAULT_BACKLOG = 10
 
 
 def _dated_name(day: str) -> str:
     return f"{LOG_PREFIX}{day}{LOG_SUFFIX}"
+
+
+def _prune_backlog(log_dir: Path, backlog: int) -> None:
+    """Delete the oldest daily logs beyond the most recent ``backlog`` files."""
+    if backlog <= 0:
+        return
+    paths = sorted(log_dir.glob(f"{LOG_PREFIX}*{LOG_SUFFIX}"))
+    for path in paths[: len(paths) - backlog]:
+        path.unlink(missing_ok=True)
 
 
 class DailyLogHandler(logging.StreamHandler):
@@ -30,13 +45,21 @@ class DailyLogHandler(logging.StreamHandler):
     pushes the completed file to ``on_complete``. Replaces a static FileHandler so a
     device running across midnight both rotates its log and ships the finished one."""
 
-    def __init__(self, log_dir: Path, *, now: Callable[[], datetime] = datetime.now) -> None:
+    def __init__(
+        self,
+        log_dir: Path,
+        *,
+        now: Callable[[], datetime] = datetime.now,
+        backlog: int = DEFAULT_BACKLOG,
+    ) -> None:
         self._log_dir = Path(log_dir)
         self._log_dir.mkdir(parents=True, exist_ok=True)
         self._now = now
+        self._backlog = backlog
         self.on_complete: Optional[Callable[[Path], None]] = None
         self._day = self._today()
         super().__init__(self._open(self._day))
+        _prune_backlog(self._log_dir, self._backlog)
 
     @property
     def log_dir(self) -> Path:
@@ -68,6 +91,7 @@ class DailyLogHandler(logging.StreamHandler):
                     self.on_complete(completed)
                 except Exception:  # shipping must never break logging
                     logging.getLogger(__name__).exception("log ship-on-rollover failed")
+            _prune_backlog(self._log_dir, self._backlog)
         super().emit(record)
 
 

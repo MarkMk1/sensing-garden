@@ -15,7 +15,7 @@ from bugcam.edge26.capture import VideoRecorder
 from bugcam.edge26.processing import VideoProcessor, HailoClassifier
 from bugcam.edge26.output import ResultsWriter
 from bugcam.edge26.queue import ClassificationQueue, QueueEntry
-from bugcam.log_shipping import DailyLogHandler, ship_existing_logs
+from bugcam.log_shipping import DEFAULT_BACKLOG, DailyLogHandler, ship_existing_logs
 
 # Producer-owned utility dirs under a device dir, not per-timestamp result
 # directories -- the sweep and inventory must never treat them as results
@@ -23,18 +23,20 @@ from bugcam.log_shipping import DailyLogHandler, ship_existing_logs
 NON_RESULT_SUBDIRS = {"heartbeats", "environment", "logs"}
 
 
-def setup_logging(log_dir: Path, *, on_log_complete=None) -> None:
+def setup_logging(log_dir: Path, *, on_log_complete=None, log_backlog: int = DEFAULT_BACKLOG) -> None:
     """Configure logging to console and a daily-rotating file.
 
     When ``on_log_complete`` is given, the log mechanism owns shipping: a completed
     (rolled-over) file is pushed to it, and any non-today logs left by a prior run are
     shipped now. The upload subsystem never scans for logs. When it is ``None``
-    (uploads disabled), nothing ships logs -- they accumulate on disk locally."""
+    (uploads disabled), nothing ships logs. Either way, at most ``log_backlog`` daily
+    log files are kept on disk -- older ones are pruned on rollover so unshipped logs
+    don't accumulate forever."""
     log_dir.mkdir(parents=True, exist_ok=True)
 
     #TODO I think this is handling logging for the application broadly,
     # so it should be declared outside of edge26
-    file_handler = DailyLogHandler(log_dir)
+    file_handler = DailyLogHandler(log_dir, backlog=log_backlog)
     file_handler.on_complete = on_log_complete
 
     # Format

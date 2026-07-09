@@ -72,3 +72,40 @@ def test_ship_existing_enqueues_only_completed_logs(tmp_path):
 
 def test_ship_existing_no_logs_is_noop(tmp_path):
     assert ship_existing_logs(lambda p: None, tmp_path / "missing", now=_Clock("20260103")) == 0
+
+
+def test_backlog_pruned_on_init(tmp_path):
+    for day in range(1, 13):  # 12 pre-existing daily logs, most recent is "today"
+        (tmp_path / f"edge26_202601{day:02d}.log").write_text("x\n")
+
+    h = DailyLogHandler(tmp_path, now=_Clock("20260112"), backlog=10)
+    h.close()
+
+    remaining = sorted(p.name for p in tmp_path.glob("edge26_*.log"))
+    assert remaining == [f"edge26_202601{day:02d}.log" for day in range(3, 13)]
+
+
+def test_backlog_pruned_on_rollover_even_when_completed_file_not_deleted(tmp_path):
+    clock = _Clock("20260101")
+    h = DailyLogHandler(tmp_path, now=clock, backlog=2)
+    h.on_complete = lambda path: None  # simulates uploads disabled: file stays on disk
+
+    h.emit(_record("day one"))
+    clock.set("20260102")
+    h.emit(_record("day two"))
+    clock.set("20260103")
+    h.emit(_record("day three"))
+
+    remaining = sorted(p.name for p in tmp_path.glob("edge26_*.log"))
+    assert remaining == ["edge26_20260102.log", "edge26_20260103.log"]
+    h.close()
+
+
+def test_backlog_zero_disables_pruning(tmp_path):
+    for day in range(1, 4):
+        (tmp_path / f"edge26_202601{day:02d}.log").write_text("x\n")
+
+    h = DailyLogHandler(tmp_path, now=_Clock("20260103"), backlog=0)
+    h.close()
+
+    assert len(list(tmp_path.glob("edge26_*.log"))) == 3
