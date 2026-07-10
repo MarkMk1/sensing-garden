@@ -2,7 +2,6 @@ import json
 import logging
 import multiprocessing as mp
 import queue
-import shutil
 import sys
 import threading
 import time
@@ -12,6 +11,7 @@ from datetime import datetime, timezone
 import cv2
 
 from bugcam.edge26.capture import VideoRecorder
+from bugcam.edge26.detector import Detector
 from bugcam.edge26.processing import VideoProcessor, HailoClassifier
 from bugcam.edge26.output import ResultsWriter
 from bugcam.edge26.queue import ClassificationQueue, QueueEntry
@@ -61,21 +61,18 @@ logger = logging.getLogger("edge26")
 class Pipeline:
     """
     Main pipeline orchestrating capture and processing.
-    
+
     Architecture:
-        - Detection thread: Runs BugSpot detection/tracking (maintains tracker state)
+        - Detector child: Runs BugSpot detection/tracking (maintains tracker
+          state) in a thread, or standalone in a dedicated subprocess
         - Classification thread: Runs Hailo classification (shared resource)
         - Classification queue: Disk-based FIFO queue for both FLIK and DOT tracks
     """
-    
+
     def __init__(
         self,
         config: dict,
         *,
-        detection_child: bool = False,
-        shared_video_queue=None,
-        shared_stop_event=None,
-        shared_recording_stopped=None,
         on_result_ready=None,
         on_video_ready=None,
     ):
@@ -91,27 +88,18 @@ class Pipeline:
         self.continuous_tracking = pipeline_config.get("continuous_tracking", False)
 
         # Run the GIL-heavy detection loop in its own subprocess so it cannot
-        # starve the recorder threads (dropped-frame fix). The child is a
-        # detection-only Pipeline; the parent keeps recording + classification.
+        # starve the recorder threads (dropped-frame fix). The subprocess runs
+        # a standalone Detector; the parent keeps recording + classification.
         self.detection_in_subprocess = pipeline_config.get("detection_in_subprocess", False)
-        self._detection_child = detection_child
-        if self._detection_child:
-            # The detection child never records or classifies.
-            self.enable_recording = False
-            self.enable_classification = False
-            self.enable_processing = True
-        # This instance runs the detection loop (and owns the tracker-reset
-        # markers) when monolithic, or when it is the detection child.
-        self._owns_detection = (not self.detection_in_subprocess) or self._detection_child
 
         # Coordination primitives. In subprocess mode the recorder (parent) and
         # detection loop (child) live in different processes, so the queue and
         # events must be multiprocessing-backed and shared between them.
         if self.detection_in_subprocess:
             self._mp_ctx = mp.get_context("spawn")
-            self.video_queue = shared_video_queue or self._mp_ctx.JoinableQueue()
-            self.stop_event = shared_stop_event or self._mp_ctx.Event()
-            self.recording_stopped = shared_recording_stopped or self._mp_ctx.Event()
+            self.video_queue = self._mp_ctx.JoinableQueue()
+            self.stop_event = self._mp_ctx.Event()
+            self.recording_stopped = self._mp_ctx.Event()
         else:
             self._mp_ctx = None
             self.video_queue = queue.Queue()
@@ -122,55 +110,53 @@ class Pipeline:
         self.detection_thread = None
         self.detection_process = None
         self.classification_thread = None
-        
+
         # Device config
         device_config = config.get("device", {})
         self.flick_id = device_config.get("flick_id", "edge26")
         self.dot_ids = device_config.get("dot_ids", [])
         self.input_storage = Path(config["paths"]["input_storage"])
-        
+
         # Output paths
         self.results_dir = Path(config["output"]["results_dir"])
-        
+
         # Pending queue for classification
-        pending_dir = Path(config["paths"].get("pending_dir", 
+        pending_dir = Path(config["paths"].get("pending_dir",
                          Path(config["paths"]["input_storage"]).parent / "pending"))
         self.classification_queue = ClassificationQueue(pending_dir)
-        
-        # --- Video sampling (save 1 video per N to output) ---
-        self._video_batch_count = 0
-        self._video_sample_saved = False
-        self._video_sample_interval = pipeline_config.get("video_sample_interval", 10)
-        
-        # --- Tracker reset signals (continuous_tracking mode) ---
-        self._sweep_counter = 0
-        self._sweep_interval = 30
-        # 1. Day-change: reset when the date in the filename changes
-        self._last_video_date: str = ""
-        # 2. Recording-stop: reset after the last recorded video is processed
-        #    Persisted via .last_recording marker file so it survives restarts.
-        self._reset_after_video: str = ""
-        self._pending_tracker_reset = False
-        # Only the instance that runs the detection loop touches the tracker-reset
-        # markers. In subprocess mode that's the child (at its own startup), so the
-        # parent must not consume/unlink the marker out from under it.
-        if self.continuous_tracking and self._owns_detection:
-            self._load_last_recording_marker()
-        
+
         # Initialize components based on mode
         self.recorder = self._init_recorder() if self.enable_recording else None
         self.processor = VideoProcessor(config) if self.enable_processing else None
         self.writer = ResultsWriter(config["output"]) if self.enable_processing else None
-        
+
+        # Detector child. In-process it shares this pipeline's processor,
+        # writer and classification queue; in subprocess mode the detection
+        # subprocess builds its own Detector instead (see
+        # _detection_subprocess_entry), so there is none to hold here.
+        if self.enable_processing and not self.detection_in_subprocess:
+            self.detector = Detector(
+                config,
+                video_queue=self.video_queue,
+                stop_event=self.stop_event,
+                recording_stopped=self.recording_stopped,
+                processor=self.processor,
+                writer=self.writer,
+                classification_queue=self.classification_queue,
+                on_result_ready=self._notify_result_ready,
+            )
+        else:
+            self.detector = None
+
         # Eagerly initialize classifier for the classification thread
         if self.enable_classification and self.processor:
             self.processor._classifier = HailoClassifier(self.processor.classification_config)
             logger.info("Hailo classifier initialized")
-        
+
         logger.info("=" * 60)
         logger.info("EDGE26 PIPELINE INITIALIZED")
         logger.info("=" * 60)
-        
+
         # Mode info
         mode = "RECORD + PROCESS" if (self.enable_recording and self.enable_processing) else \
                "RECORD ONLY" if self.enable_recording else \
@@ -193,13 +179,13 @@ class Pipeline:
             logger.info(f"Recording mode: {rec_mode}"
                        + (f" (every {pipeline_config.get('recording_interval_minutes', 5)} min)"
                           if rec_mode == "interval" else ""))
-    
+
     def _init_recorder(self) -> VideoRecorder:
         """Initialize video recorder from config."""
         paths = self.config["paths"]
         capture = self.config["capture"]
         pipeline_cfg = self.config.get("pipeline", {})
-        
+
         return VideoRecorder(
             output_dir=paths["input_storage"],
             fps=capture["fps"],
@@ -213,7 +199,7 @@ class Pipeline:
             interval_minutes=pipeline_cfg.get("recording_interval_minutes", 5),
             bitrate=capture.get("bitrate", 20_000_000),
         )
-    
+
     def _notify_result_ready(self, output_dir: Path) -> None:
         """Tell the upload owner (Pollen) a result dir is finalized, if wired."""
         if self._on_result_ready is not None:
@@ -247,142 +233,6 @@ class Pipeline:
         video_path.unlink()
         logger.info("DOT video staged for upload: %s (dropped local copy)", video_path.name)
 
-    def _is_flick_video(self, path: Path) -> bool:
-        """Check if a path is a FLICK video (matches flick_id prefix)."""
-        return (path.is_file()
-                and path.suffix == ".mp4"
-                and path.name.startswith(f"{self.flick_id}_"))
-    
-    def _is_dot_directory(self, path: Path) -> bool:
-        """Check if a path is a DOT device directory (matches a dot_id prefix)."""
-        if not path.is_dir():
-            return False
-        return any(path.name.startswith(f"{dot_id}_") for dot_id in self.dot_ids)
-    
-    def _find_existing_items(self) -> list:
-        """
-        Find existing videos and DOT directories in input_storage.
-        
-        Returns a sorted list of (path, type) tuples where type is
-        "video" or "dot". Only items matching configured device IDs
-        are included. Sorted by name gives chronological order since
-        filenames and directory names both contain timestamps.
-        """
-        if not self.input_storage.exists():
-            return []
-        
-        items = []
-        for entry in sorted(self.input_storage.iterdir()):
-            if self._is_flick_video(entry):
-                items.append((entry, "video"))
-            elif self.dot_ids and self._is_dot_directory(entry):
-                items.append((entry, "dot"))
-        
-        if items:
-            n_videos = sum(1 for _, t in items if t == "video")
-            n_dots = sum(1 for _, t in items if t == "dot")
-            parts = []
-            if n_videos:
-                parts.append(f"{n_videos} video(s)")
-            if n_dots:
-                parts.append(f"{n_dots} DOT dir(s)")
-            logger.info(f"Found {', '.join(parts)} to process")
-        
-        return items
-    
-    def _find_dot_directories(self) -> list:
-        """Find unprocessed DOT directories in input_storage."""
-        if not self.input_storage.exists() or not self.dot_ids:
-            return []
-        
-        return [d for d in sorted(self.input_storage.iterdir())
-                if self._is_dot_directory(d)]
-    
-    def _parse_dot_dir_name(self, dir_name: str):
-        """
-        Parse a DOT directory name into (dot_id, date_str).
-        
-        Directory name format: {dot_id}_{YYYYMMDD}
-        Returns (dot_id, "YYYYMMDD") or (None, None).
-        """
-        for dot_id in self.dot_ids:
-            if dir_name.startswith(f"{dot_id}_"):
-                date_str = dir_name[len(dot_id) + 1:]
-                return dot_id, date_str
-        return None, None
-    
-    def _compute_output_dir(self, device_id: str, date_time: str) -> Path:
-        """Compute the output directory for a device and timestamp."""
-        return self.results_dir / device_id / date_time
-    
-    def _find_ready_dot_tracks(self, dot_dir: Path) -> list:
-        """Find tracks within a DOT directory that have a done.txt signal."""
-        crops_dir = dot_dir / "crops"
-        if not crops_dir.exists():
-            return []
-        return [d for d in sorted(crops_dir.iterdir())
-                if d.is_dir() and (d / "done.txt").exists()]
-    
-    def _find_latest_background(self, dot_dir: Path):
-        """Find the most recent background image in a DOT directory."""
-        backgrounds = sorted(dot_dir.glob("*_background.jpg"))
-        if backgrounds:
-            return backgrounds[-1]
-        fallback = dot_dir / "current_background.jpg"
-        return fallback if fallback.exists() else None
-    
-    def _process_dot_media(self, dot_dir: Path) -> None:
-        """Copy videos and backgrounds to output regardless of track readiness.
-        
-        Ensures media files reach S3 quickly even when no insect tracks
-        have been detected yet. Called on every detection worker poll.
-        """
-        try:
-            dot_id, date_str = self._parse_dot_dir_name(dot_dir.name)
-            if not dot_id:
-                return
-            
-            output_dir = self._compute_output_dir(dot_id, date_str)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            copied_something = False
-            
-            videos_dir = dot_dir / "videos"
-            if videos_dir.exists():
-                dst_videos = output_dir / "videos"
-                dst_videos.mkdir(parents=True, exist_ok=True)
-                for vid in sorted(videos_dir.iterdir()):
-                    if vid.is_file() and vid.suffix == ".mp4":
-                        dst = dst_videos / vid.name
-                        if not dst.exists():
-                            shutil.copy2(vid, dst)
-                            logger.info(f"  Video copied: {vid.name}")
-                            copied_something = True
-                            # Detection runs in a subprocess with no upload callback, so
-                            # hand the video to the main-process classification worker
-                            # (which owns Pollen) via the disk queue, same path as tracks.
-                            self.classification_queue.enqueue(
-                                entry_type="video",
-                                source_device=dot_id,
-                                date=date_str,
-                                track_id=dst.stem,
-                                track_dir=dst,
-                                output_dir=dst.parent,
-                            )
-                        vid.unlink()
-            
-            background = self._find_latest_background(dot_dir)
-            if background:
-                dst_background = output_dir / background.name
-                if not dst_background.exists():
-                    shutil.copy2(background, dst_background)
-                    logger.info(f"  Background copied: {background.name}")
-            
-            if copied_something:
-                logger.info(f"MEDIA: Copied new files from {dot_dir.name} to {output_dir.name}")
-        
-        except Exception as e:
-            logger.error(f"Failed to process media from {dot_dir.name}: {e}", exc_info=True)
-    
     @staticmethod
     def _deduplicate_track_id(track_id: str, results: dict) -> str:
         """If track_id already exists in results, append a suffix to make it unique."""
@@ -417,430 +267,46 @@ class Pipeline:
             },
             "tracks": [],
         }
-    
-    # ------------------------------------------------------------------
-    # Last-recording marker (persists across restarts)
-    # ------------------------------------------------------------------
-    
-    @property
-    def _marker_path(self) -> Path:
-        return self.input_storage / ".last_recording"
-    
-    def _load_last_recording_marker(self) -> None:
-        """Read the .last_recording marker on startup."""
-        if not self._marker_path.exists():
-            return
-        
-        marker_video = self._marker_path.read_text().strip()
-        if not marker_video:
-            self._marker_path.unlink(missing_ok=True)
-            return
-        
-        if (self.input_storage / marker_video).exists():
-            # Video still waiting to be processed
-            self._reset_after_video = marker_video
-            logger.info(f"Previous session marker: will reset tracker after {marker_video}")
-        else:
-            # Already processed (deleted) — reset before next video
-            self._pending_tracker_reset = True
-            self._marker_path.unlink(missing_ok=True)
-            logger.info(f"Previous session ended ({marker_video} already processed), "
-                       f"tracker will reset on next video")
-    
+
     def _save_last_recording_marker(self) -> None:
-        """Write the .last_recording marker when recording stops."""
+        """Write the .last_recording marker when recording stops.
+
+        An in-process Detector picks up the boundary immediately; a detection
+        subprocess reads the marker file at its next startup."""
         if not (self.continuous_tracking and self.recorder
                 and self.recorder.last_chunk_path):
             return
-        
+
         filename = self.recorder.last_chunk_path.name
-        self._marker_path.write_text(filename)
-        self._reset_after_video = filename
+        (self.input_storage / ".last_recording").write_text(filename)
+        if self.detector is not None:
+            self.detector.mark_reset_after(filename)
         logger.info(f"Marked last recording: {filename}")
-    
-    def _clear_last_recording_marker(self) -> None:
-        """Delete the marker after the boundary video is processed."""
-        self._marker_path.unlink(missing_ok=True)
-        self._reset_after_video = ""
-    
-    # ------------------------------------------------------------------
-    # Detection Thread - Runs BugSpot detection/tracking
-    # ------------------------------------------------------------------
-    
-    def _detection_worker(self) -> None:
-        """
-        Worker that runs detection/tracking for videos and queues DOT tracks.
-        
-        Maintains continuous tracker state for FLIK videos.
-        Queues both FLIK and DOT tracks for classification.
-        """
-        logger.info("Detection worker started")
-        
-        # Process existing items in chronological order
-        for path, item_type in self._find_existing_items():
-            if self.stop_event.is_set():
-                break
-            if item_type == "video":
-                self._process_video_detection(path)
-            else:
-                self._process_dot_media(path)
-                self._process_dot_directory_detection(path)
-        
-        # Process new videos from queue + poll for DOT directories
-        while not self.stop_event.is_set():
-            try:
-                video_path = self.video_queue.get(timeout=1.0)
-                self._process_video_detection(video_path)
-                self.video_queue.task_done()
-                
-                # Check for DOT directories after each video (interleaved processing)
-                for dot_dir in self._find_dot_directories():
-                    if self.stop_event.is_set():
-                        break
-                    self._process_dot_media(dot_dir)
-                    self._process_dot_directory_detection(dot_dir)
-                
-                # Periodically sweep stale output directories
-                self._sweep_counter += 1
-                if self._sweep_counter >= self._sweep_interval:
-                    self._sweep_stale_directories()
-                    self._sweep_counter = 0
-                
-            except queue.Empty:
-                # Check for new DOT directories while waiting
-                for dot_dir in self._find_dot_directories():
-                    if self.stop_event.is_set():
-                        break
-                    self._process_dot_media(dot_dir)
-                    self._process_dot_directory_detection(dot_dir)
-                
-                # If recording stopped, check if we're done
-                if self.recording_stopped.is_set():
-                    remaining = self.video_queue.qsize()
-                    has_ready_tracks = any(
-                        self._find_ready_dot_tracks(d)
-                        for d in self._find_dot_directories()
-                    )
-                    pending_count = self.classification_queue.count()
-                    if remaining == 0 and not has_ready_tracks and pending_count == 0:
-                        logger.info("Queue empty - processing complete")
-                        break
-                continue
-            except Exception as e:
-                logger.error(f"Detection error: {e}", exc_info=True)
-        
-        logger.info("Detection worker stopped")
-    
-    def _process_video_detection(self, video_path: Path) -> None:
-        """
-        Process a FLIK video: detection/tracking only, queue crops for classification.
-        
-        Maintains tracker state for continuous tracking across videos.
-        """
-        if not video_path.exists():
-            logger.warning(f"Video not found: {video_path}")
-            return
-        
-        logger.info("-" * 50)
-        logger.info(f"DETECTION: {video_path.name}")
-        logger.info("-" * 50)
-        
-        try:
-            # Compute output directory: results_dir/flick_id/date_time/
-            date_time = video_path.stem[len(self.flick_id) + 1:]
-            output_dir = self._compute_output_dir(self.flick_id, date_time)
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            # --- Pre-process tracker resets (continuous_tracking only) ---
-            if self.continuous_tracking:
-                # Pending reset from a previous session whose marker video
-                # was already processed before we started
-                if self._pending_tracker_reset:
-                    logger.info("Resetting tracker (previous recording session ended)")
-                    self.processor.reset_tracker()
-                    self._pending_tracker_reset = False
-                
-                # Day-change detection
-                video_date = date_time[:8]  # YYYYMMDD
-                if self._last_video_date and video_date != self._last_video_date:
-                    logger.info(f"Day changed ({self._last_video_date} → {video_date}), resetting tracker")
-                    self.processor.reset_tracker()
-                self._last_video_date = video_date
-            
-            # Run BugSpot detection/tracking (Phases 1-4)
-            result = self.processor._pipeline.process_video(
-                str(video_path),
-                extract_crops=True,
-                render_composites=self.processor.output_config.get("save_composites", True),
-                save_crops_dir=str(output_dir / "crops"),
-                save_composites_dir=str(output_dir / "composites") if self.processor.output_config.get("save_composites", True) else None,
-            )
-            
-            logger.info(f"  BugSpot: {len(result.confirmed_tracks)} confirmed / "
-                       f"{len(result.track_paths)} total tracks")
-            
-            # Save crops and queue for classification
-            confirmed_count = 0
-            for track_id, track in result.confirmed_tracks.items():
-                # BugSpot saves crops using first 8 chars of track UUID
-                # track_id format: {uuid}_{timestamp} -> use first 8 chars for directory
-                base_track_id = track_id.split('-')[0]
-                track_dir = output_dir / "crops" / base_track_id
-                
-                if not track_dir.exists():
-                    logger.warning(f"Track directory not found: {track_dir}")
-                    continue
-                
-                # Extract timestamp from video filename
-                track_timestamp = date_time.split('_')[-1] if '_' in date_time else None
-                
-                # Queue for classification
-                self.classification_queue.enqueue(
-                    entry_type="flik",
-                    source_device=self.flick_id,
-                    date=date_time[:8],  # YYYYMMDD
-                    time=track_timestamp,
-                    track_id=track_id,
-                    track_dir=track_dir,
-                    output_dir=output_dir,
-                    num_crops=len(track.crops),
-                )
-                confirmed_count += 1
-            
-            # Sample video: save 1 per N to output (0 = disabled)
-            if self._video_sample_interval > 0:
-                self._video_batch_count += 1
-                is_last_in_batch = self._video_batch_count >= self._video_sample_interval
-                
-                if not self._video_sample_saved and (confirmed_count > 0 or is_last_in_batch):
-                    shutil.copy2(video_path, output_dir / "video.mp4")
-                    self._video_sample_saved = True
-                    reason = "detections" if confirmed_count > 0 else "fallback"
-                    logger.info(f"  Sample video saved ({reason})")
-                
-                if is_last_in_batch:
-                    self._video_batch_count = 0
-                    self._video_sample_saved = False
-            
-            # Clear detections but KEEP tracker state (continuous tracking)
-            self.processor.clear_video_detections()
-            
-            # Delete processed video
-            self._delete_video(video_path)
-            
-            # Recording-stop boundary: reset tracker after the last
-            # video from the previous recording session
-            if self._reset_after_video and video_path.name == self._reset_after_video:
-                logger.info("Last recorded video processed, resetting tracker")
-                self.processor.reset_tracker()
-                self._clear_last_recording_marker()
-            
-            logger.info(f"QUEUED: {confirmed_count} tracks for classification")
-            
-            # Save detection metadata for classification thread to merge into results
-            if confirmed_count > 0:
-                # Backend parses video_timestamp as ISO-8601; date_time is the
-                # compact YYYYMMDD_HHMMSS_micros video stem (matches processor.py).
-                date_str, time_str = date_time.split('_')[:2]
-                video_timestamp_iso = datetime.strptime(
-                    f"{date_str}_{time_str}", "%Y%m%d_%H%M%S"
-                ).isoformat()
-                detection_meta = {
-                    "source_device": self.flick_id,
-                    "date": date_time[:8],
-                    "video_file": video_path.name,
-                    "video_timestamp": video_timestamp_iso,
-                    "model_id": self.config.get("model", {}).get("model_id"),
-                    "video_info": {
-                        "fps": result.video_info.get("fps"),
-                        "total_frames": result.video_info.get("total_frames"),
-                        "duration_seconds": result.video_info.get("duration"),
-                    } if hasattr(result, "video_info") and result.video_info else None,
-                    "summary": {
-                        "total_detections": len(result.all_detections) if hasattr(result, "all_detections") else 0,
-                        "total_tracks": len(result.track_paths) if hasattr(result, "track_paths") else 0,
-                        "confirmed_tracks": len(result.confirmed_tracks),
-                        "unconfirmed_tracks": (len(result.track_paths) - len(result.confirmed_tracks)) if hasattr(result, "track_paths") else 0,
-                    },
-                    "tracks": {
-                        tid: {
-                            "num_detections": track.num_detections if hasattr(track, "num_detections") else None,
-                            "first_seen_seconds": track.first_frame_time if hasattr(track, "first_frame_time") else None,
-                            "last_seen_seconds": track.last_frame_time if hasattr(track, "last_frame_time") else None,
-                            "duration_seconds": track.duration if hasattr(track, "duration") else None,
-                            "topology_metrics": track.topology_metrics if hasattr(track, "topology_metrics") else None,
-                        }
-                        for tid, track in result.confirmed_tracks.items()
-                    },
-                    "frame_detections": {
-                        track_id: [
-                            {
-                                "frame_number": det.get("frame_number"),
-                                "timestamp_seconds": det.get("frame_time_seconds"),
-                                "bbox": det.get("bbox"),
-                            }
-                            for det in result.all_detections
-                            if det.get("track_id") == track_id
-                        ]
-                        for track_id in result.confirmed_tracks
-                    } if hasattr(result, "all_detections") else {},
-                }
-                meta_path = output_dir / ".detection.json"
-                meta_path.write_text(json.dumps(detection_meta, indent=2, default=str))
-                
-                # Write expected track count for completeness check
-                (output_dir / ".expected_tracks").write_text(str(confirmed_count))
-                logger.info(f"  Detection metadata saved ({confirmed_count} tracks)")
-            else:
-                # No confirmed tracks — write empty results and mark done so
-                # the upload thread can discover and clean up this directory
-                empty_results = {
-                    "source_device": self.flick_id,
-                    "date": date_time[:8],
-                    "processing_timestamp": datetime.now(timezone.utc).isoformat(),
-                    "summary": {
-                        "total_detections": 0,
-                        "total_tracks": 0,
-                        "confirmed_tracks": 0,
-                        "unconfirmed_tracks": 0,
-                    },
-                    "tracks": [],
-                }
-                self.writer.write_results(results=empty_results, output_dir=output_dir)
-                (output_dir / ".done").write_text("classified=0\nexpected=0\n")
-                logger.info("  No confirmed tracks, marked directory done")
-                self._notify_result_ready(output_dir)
 
-        except Exception as e:
-            logger.error(f"Failed to process {video_path.name}: {e}", exc_info=True)
-    
-    def _process_dot_directory_detection(self, dot_dir: Path) -> None:
-        """
-        Process DOT directory: copy crops/labels, queue for classification.
-        
-        Does NOT touch the tracker - DOT processing is independent.
-        """
-        try:
-            dot_id, date_str = self._parse_dot_dir_name(dot_dir.name)
-            if not dot_id:
-                logger.warning(f"Could not parse DOT directory: {dot_dir.name}")
-                return
-            
-            ready_tracks = self._find_ready_dot_tracks(dot_dir)
-            if not ready_tracks:
-                return
-            
-            logger.info("-" * 50)
-            logger.info(f"DOT DETECTION: {dot_dir.name} ({len(ready_tracks)} track(s) ready)")
-            logger.info("-" * 50)
-            
-            # Videos are handled separately by _process_dot_media (a standalone unit
-            # under <dot>/<YYYYMMDD>/videos/); detection only owns the tracks.
-            background = self._find_latest_background(dot_dir)
-
-            # Each ready track becomes its own terminal result dir,
-            # <dot>/<YYYYMMDD>/<track_id>_<HHMMSS>/: one results.json + .done,
-            # uploaded once and deleted (no day-bucket accumulation).
-            queued_count = 0
-            for track_dir in ready_tracks:
-                if self.stop_event.is_set():
-                    break
-
-                track_dir_name = track_dir.name
-                track_id = track_dir_name.rsplit("_", 1)[0]
-                track_timestamp = track_dir_name.rsplit("_", 1)[-1] if "_" in track_dir_name else None
-
-                track_output_dir = self._compute_output_dir(dot_id, f"{date_str}/{track_dir_name}")
-                track_output_dir.mkdir(parents=True, exist_ok=True)
-
-                # Background lives in the track dir so the composite step has it after
-                # the incoming DOT dir is cleaned up; the dir is terminal so it's local.
-                track_background = None
-                if background:
-                    track_background = track_output_dir / background.name
-                    shutil.copy2(background, track_background)
-
-                # Copy crops to output
-                dst_crops = track_output_dir / "crops" / track_dir_name
-                dst_crops.mkdir(parents=True, exist_ok=True)
-
-                crop_count = 0
-                for f in track_dir.iterdir():
-                    if f.name != "done.txt" and f.is_file():
-                        shutil.copy2(f, dst_crops / f.name)
-                        crop_count += 1
-
-                # Copy label file to output
-                label_src = dot_dir / "labels" / f"{track_id}.json"
-                dst_labels = track_output_dir / "labels"
-                dst_labels.mkdir(parents=True, exist_ok=True)
-                if label_src.exists():
-                    shutil.copy2(label_src, dst_labels / f"{track_id}.json")
-
-                # Queue for classification. track_id stays bare: the backend
-                # reconstructs crop/composite keys as {track_id}_{timestamp} and keys
-                # the tracks table on (device_id, timestamp), not track_id.
-                self.classification_queue.enqueue(
-                    entry_type="dot",
-                    source_device=dot_id,
-                    date=date_str,
-                    time=track_timestamp,
-                    track_id=track_id,
-                    track_dir=dst_crops,
-                    output_dir=track_output_dir,
-                    labels_path=dst_labels / f"{track_id}.json" if label_src.exists() else None,
-                    background_path=track_background,
-                    num_crops=crop_count,
-                )
-                # One track per dir: complete-on-single, so .done fires immediately.
-                (track_output_dir / ".expected_tracks").write_text("1")
-                queued_count += 1
-
-                # Delete processed track from input
-                shutil.rmtree(track_dir)
-                logger.info(
-                    "DOT track -> %s/%s/%s (%d crops, bare id=%s)",
-                    dot_id, date_str, track_dir_name, crop_count, track_id,
-                )
-
-            logger.info(f"QUEUED: {queued_count} DOT tracks for classification")
-            
-            # Clean up DOT directory if empty after processing
-            try:
-                remaining = list(dot_dir.iterdir())
-                if not remaining:
-                    dot_dir.rmdir()
-                    logger.info(f"Removed empty DOT directory: {dot_dir.name}")
-            except OSError:
-                pass
-        
-        except Exception as e:
-            logger.error(f"Failed to process DOT {dot_dir.name}: {e}", exc_info=True)
-    
     # ------------------------------------------------------------------
     # Classification Thread - Runs Hailo classification
     # ------------------------------------------------------------------
-    
+
     def _classification_worker(self) -> None:
         """
         Worker that processes classification queue (FIFO).
-        
+
         Classifies tracks from both FLIK and DOT sources.
         """
         logger.info("Classification worker started")
-        
+
         # Recover any pending from crash
         self.classification_queue.recover()
-        
+
         while not self.stop_event.is_set():
             result = self.classification_queue.get_next()
-            
+
             if result is None:
                 time.sleep(0.5)
                 continue
-            
+
             filepath, entry = result
-            
+
             try:
                 if entry.entry_type == "flik":
                     self._classify_flik_track(entry)
@@ -848,9 +314,9 @@ class Pipeline:
                     self._publish_dot_video(entry)
                 else:
                     self._classify_dot_track(entry)
-                
+
                 self.classification_queue.remove(filepath)
-                
+
             except Exception as e:
                 logger.error(f"Classification failed for {filepath.name}: {e}", exc_info=True)
                 should_retry = self.classification_queue.mark_failed(filepath, entry, str(e))
@@ -859,45 +325,45 @@ class Pipeline:
                 else:
                     # Permanently failed — still count as completed for .done check
                     self._check_classification_complete(Path(entry.output_dir))
-        
+
         logger.info("Classification worker stopped")
-    
+
     def _classify_flik_track(self, entry: QueueEntry) -> None:
         """Classify a FLIK track from queue entry."""
         track_dir = Path(entry.track_dir)
         output_dir = Path(entry.output_dir)
-        
+
         if not track_dir.exists():
             logger.warning(f"Track directory not found: {track_dir}")
             self._check_classification_complete(output_dir)
             return
-        
+
         logger.info(f"CLASSIFY FLIK: {entry.track_id} ({entry.num_crops} crops)")
-        
+
         # Load crops
         crop_files = sorted(track_dir.glob("frame_*.jpg"))
         if not crop_files:
             logger.warning(f"No crops found in {track_dir}")
             self._check_classification_complete(output_dir)
             return
-        
+
         # Ensure classifier is initialized
         if self.processor._classifier is None:
             self.processor._classifier = HailoClassifier(self.processor.classification_config)
-        
+
         # Classify
         classifications = []
         frames = []
-        
+
         for crop_path in crop_files:
             crop = cv2.imread(str(crop_path))
             if crop is None:
                 continue
-            
+
             frame_num = int(crop_path.stem.split("_")[1])
             classification = self.processor._classifier.classify(crop)
             classifications.append(classification)
-            
+
             frames.append({
                 "frame_number": frame_num,
                 "prediction": {
@@ -909,30 +375,30 @@ class Pipeline:
                     "species_confidence": classification.species_confidence,
                 }
             })
-        
+
         if not classifications:
             self._check_classification_complete(output_dir)
             return
-        
+
         # Hierarchical aggregation
         final_pred = self.processor._classifier.hierarchical_aggregate(classifications)
         if not final_pred:
             self._check_classification_complete(output_dir)
             return
-        
+
         logger.info(f"  {final_pred['family']} / {final_pred['genus']} / {final_pred['species']} "
                    f"({final_pred['species_confidence']:.1%})")
-        
+
         # Load existing results
         results_path = output_dir / "results.json"
         results = self._load_existing_results(results_path)
-        
+
         # Load detection metadata to enrich results
         detection_meta = self._load_detection_meta(output_dir)
-        
+
         # Deduplicate track_id if this is a retry after crash
         track_id = self._deduplicate_track_id(entry.track_id, results)
-        
+
         # Enrich results with detection metadata (first track writes top-level fields)
         if detection_meta and not results.get("video_file"):
             results["video_file"] = detection_meta.get("video_file")
@@ -943,15 +409,15 @@ class Pipeline:
             results["date"] = detection_meta.get("date", entry.date)
         results["source_device"] = entry.source_device
         results["processing_timestamp"] = datetime.now(timezone.utc).isoformat()
-        
+
         # Build per-track frame data, enriched with detection metadata
         track_frames = frames
         track_meta = detection_meta.get("tracks", {}).get(entry.track_id, {}) if detection_meta else {}
         frame_dets = detection_meta.get("frame_detections", {}).get(entry.track_id, []) if detection_meta else []
-        
+
         if detection_meta and not track_meta and not frame_dets:
             logger.warning(f"Track {entry.track_id} not found in detection metadata, enrichment skipped")
-        
+
         if frame_dets or track_meta:
             frame_det_map = {fd["frame_number"]: fd for fd in frame_dets if fd.get("frame_number") is not None}
             enriched_frames = []
@@ -965,7 +431,7 @@ class Pipeline:
                         enriched["bbox"] = fd["bbox"]
                 enriched_frames.append(enriched)
             track_frames = enriched_frames
-        
+
         # Update results
         track_result = {
             "track_id": track_id,
@@ -982,9 +448,9 @@ class Pipeline:
             track_result["duration_seconds"] = track_meta["duration_seconds"]
         if track_meta.get("topology_metrics") is not None:
             track_result["topology_metrics"] = track_meta["topology_metrics"]
-        
+
         results["tracks"].append(track_result)
-        
+
         # Update summary: total counts from detection metadata, confirmed from actual classified tracks
         if detection_meta and "summary" in detection_meta:
             results["summary"]["total_detections"] = detection_meta["summary"].get("total_detections", 0)
@@ -994,48 +460,48 @@ class Pipeline:
             results["summary"]["total_detections"] = sum(t.get("num_detections", 0) for t in results["tracks"])
             results["summary"]["total_tracks"] = len(results["tracks"])
         results["summary"]["confirmed_tracks"] = len(results["tracks"])
-        
+
         # Write results
         self.writer.write_results(results=results, output_dir=output_dir)
-        
+
         # Check if all tracks for this output directory are done
         self._check_classification_complete(output_dir)
-    
+
     def _classify_dot_track(self, entry: QueueEntry) -> None:
         """Classify a DOT track from queue entry."""
         track_dir = Path(entry.track_dir)
         output_dir = Path(entry.output_dir)
-        
+
         if not track_dir.exists():
             logger.warning(f"Track directory not found: {track_dir}")
             self._check_classification_complete(output_dir)
             return
-        
+
         logger.info(f"CLASSIFY DOT: {entry.track_id} ({entry.num_crops} crops)")
-        
+
         # Classify using existing method
         track_result = self.processor.classify_dot_track(
             track_dir, entry.track_id, entry.time
         )
-        
+
         if not track_result:
             self._check_classification_complete(output_dir)
             return
-        
+
         final = track_result.get("final_prediction", {})
         logger.info(f"  {final.get('family', 'N/A')} / {final.get('genus', 'N/A')} / "
                    f"{final.get('species', 'N/A')} ({final.get('species_confidence', 0):.1%})")
-        
+
         # Create composite if background available
         if entry.background_path:
             background_path = Path(entry.background_path)
             labels_path = Path(entry.labels_path) if entry.labels_path else None
             composite_dir = output_dir / "composites"
             composite_dir.mkdir(parents=True, exist_ok=True)
-            
+
             track_dir_name = f"{entry.track_id}_{entry.time}" if entry.time else entry.track_id
             composite_path = composite_dir / f"{track_dir_name}.jpg"
-            
+
             try:
                 if labels_path and labels_path.exists():
                     self.processor.create_dot_composite(
@@ -1044,40 +510,32 @@ class Pipeline:
                     logger.debug("  Composite saved")
             except Exception as e:
                 logger.warning(f"  Could not create composite: {e}")
-        
+
         # Load existing results
         results_path = output_dir / "results.json"
         results = self._load_existing_results(results_path)
-        
+
         # Deduplicate track_id if this is a retry after crash
         track_id = self._deduplicate_track_id(track_result["track_id"], results)
         track_result["track_id"] = track_id
-        
+
         # Update results
         results["tracks"].append(track_result)
         results["source_device"] = entry.source_device
         results["date"] = entry.date
         results["processing_timestamp"] = datetime.now(timezone.utc).isoformat()
-        
+
         # Update summary
         results["summary"]["total_tracks"] = len(results["tracks"])
         results["summary"]["confirmed_tracks"] = len(results["tracks"])
         results["summary"]["total_detections"] = sum(t.get("num_detections", 0) for t in results["tracks"])
-        
+
         # Write results
         self.writer.write_results(results=results, output_dir=output_dir)
-        
+
         # Check if all tracks for this output directory are done
         self._check_classification_complete(output_dir)
-    
-    def _delete_video(self, video_path: Path) -> None:
-        """Delete processed video."""
-        try:
-            video_path.unlink()
-            logger.debug(f"Deleted: {video_path.name}")
-        except Exception as e:
-            logger.error(f"Could not delete {video_path.name}: {e}")
-    
+
     @staticmethod
     def _load_detection_meta(output_dir: Path) -> dict:
         """Load detection metadata sidecar if available."""
@@ -1088,7 +546,7 @@ class Pipeline:
             except (json.JSONDecodeError, OSError) as e:
                 logger.warning(f"Could not read detection metadata: {e}")
         return {}
-    
+
     def _check_classification_complete(self, output_dir: Path) -> None:
         """
         Increment completed count and check if all tracks for this dir are done.
@@ -1125,87 +583,17 @@ class Pipeline:
             detection_meta_path = output_dir / ".detection.json"
             detection_meta_path.unlink(missing_ok=True)
             self._notify_result_ready(output_dir)
-    
-    def _sweep_stale_directories(self) -> None:
-        """Clean up FLIK output directories that are stuck without .done markers.
-        
-        Handles two cases:
-        1. Directories with results.json but no .done and no pending classification
-           entries — likely a crash left them incomplete. If older than 30 minutes,
-           write .done so the upload thread can pick them up.
-        2. Empty directories with no results.json and no .done — created by detection
-           but never populated. Remove them if older than 10 minutes.
-        """
-        stale_threshold_seconds = 30 * 60
-        empty_threshold_seconds = 10 * 60
-        
-        try:
-            for device_dir in self.results_dir.iterdir():
-                if not device_dir.is_dir():
-                    continue
-                for output_dir in device_dir.iterdir():
-                    if not output_dir.is_dir():
-                        continue
-                    
-                    done_path = output_dir / ".done"
-                    if done_path.exists():
-                        continue
-                    
-                    results_path = output_dir / "results.json"
-                    expected_path = output_dir / ".expected_tracks"
-                    
-                    # Case 1: Has results.json but not marked done
-                    if results_path.exists() and not expected_path.exists():
-                        # No pending classification — mark done
-                        age_seconds = (datetime.now().timestamp() - output_dir.stat().st_mtime)
-                        if age_seconds > stale_threshold_seconds:
-                            done_path.write_text("swept=stale\n")
-                            logger.info(f"Swept stale directory: {output_dir.name} (no .expected_tracks, marked done)")
-                    
-                    elif results_path.exists() and expected_path.exists():
-                        # Has expected tracks but not all completed
-                        # Check if all tracks are already classified
-                        try:
-                            expected = int(expected_path.read_text().strip())
-                        except (ValueError, OSError):
-                            expected = 0
-                        completed_path = output_dir / ".completed_tracks"
-                        try:
-                            completed = int(completed_path.read_text().strip())
-                        except (ValueError, OSError):
-                            completed = 0
-                        
-                        age_seconds = (datetime.now().timestamp() - output_dir.stat().st_mtime)
-                        if age_seconds > stale_threshold_seconds and completed >= expected:
-                            done_path.write_text(f"swept=stale\ncompleted={completed}\nexpected={expected}\n")
-                            logger.info(f"Swept stale directory: {output_dir.name} (all completed but no .done)")
-                    
-                    # Case 2: Empty directory (no results.json, no classification activity)
-                    elif not results_path.exists() and not expected_path.exists():
-                        sidecar_names = {".done", ".detection.json", ".expected_tracks", ".completed_tracks", "results.json.tmp"}
-                        has_content = False
-                        for f in output_dir.rglob("*"):
-                            if f.is_file() and f.name not in sidecar_names:
-                                has_content = True
-                                break
-                        if not has_content:
-                            age_seconds = (datetime.now().timestamp() - output_dir.stat().st_mtime)
-                            if age_seconds > empty_threshold_seconds:
-                                shutil.rmtree(output_dir)
-                                logger.info(f"Removed empty stale directory: {output_dir.name}")
-        except Exception as e:
-            logger.warning(f"Error during stale directory sweep: {e}")
-    
+
     # ------------------------------------------------------------------
     # Pipeline Control
     # ------------------------------------------------------------------
-    
+
     def start(self) -> None:
         """Start the pipeline."""
         logger.info("=" * 60)
         logger.info("STARTING PIPELINE")
         logger.info("=" * 60)
-        
+
         # Start recorder (if enabled)
         if self.enable_recording and self.recorder:
             self.recorder_thread = threading.Thread(
@@ -1217,12 +605,13 @@ class Pipeline:
             logger.info("Recorder thread started")
         else:
             self.recording_stopped.set()  # No recording
-        
-        # Start detection worker — an in-process thread, or a dedicated
-        # subprocess (separate interpreter/GIL) when detection_in_subprocess is
+
+        # Start the detection worker — the Detector child runs in an
+        # in-process thread, or standalone in a dedicated subprocess
+        # (separate interpreter/GIL) when detection_in_subprocess is
         # enabled, so detection can't starve the recorder threads.
         if self.enable_processing and self.processor:
-            if self.detection_in_subprocess and not self._detection_child:
+            if self.detection_in_subprocess:
                 self.detection_process = self._mp_ctx.Process(
                     target=_detection_subprocess_entry,
                     args=(self.config, self.video_queue,
@@ -1234,13 +623,13 @@ class Pipeline:
                 logger.info(f"Detection subprocess started (pid={self.detection_process.pid})")
             else:
                 self.detection_thread = threading.Thread(
-                    target=self._detection_worker,
+                    target=self.detector.run,
                     daemon=False,
                     name="Detection"
                 )
                 self.detection_thread.start()
                 logger.info("Detection thread started")
-            
+
             # Start classification worker
             if self.enable_classification:
                 self.classification_thread = threading.Thread(
@@ -1250,52 +639,52 @@ class Pipeline:
                 )
                 self.classification_thread.start()
                 logger.info("Classification thread started")
-        
+
         if self.enable_recording and self.enable_processing:
             logger.info("Pipeline running - Ctrl+C to stop recording (processing continues)")
         elif self.enable_recording:
             logger.info("Recording - Ctrl+C to stop")
         else:
             logger.info("Processing existing videos...")
-    
+
     def stop_recording(self) -> None:
         """Stop recording only, processing continues."""
         if not self.recording_stopped.is_set():
             logger.info("=" * 60)
             logger.info("STOPPING RECORDING")
             logger.info("=" * 60)
-            
+
             if self.recorder:
                 self.recorder.stop()
             if self.recorder_thread:
                 self.recorder_thread.join(timeout=10.0)
-            
+
             # Mark the last recorded video so tracker resets after it
             self._save_last_recording_marker()
-            
+
             self.recording_stopped.set()
             logger.info("Recording stopped - processing remaining videos...")
-            
+
             remaining = self.video_queue.qsize()
             if remaining > 0:
                 logger.info(f"Videos in queue: {remaining}")
-            
+
             pending = self.classification_queue.count()
             if pending > 0:
                 logger.info(f"Pending classifications: {pending}")
-    
+
     def stop(self) -> None:
         """Stop the pipeline gracefully."""
         logger.info("=" * 60)
         logger.info("STOPPING PIPELINE")
         logger.info("=" * 60)
-        
+
         # Stop recorder first
         self.stop_recording()
-        
+
         # Stop threads / detection subprocess
         self.stop_event.set()
-        
+
         if self.detection_process:
             self.detection_process.join(timeout=30.0)
             if self.detection_process.is_alive():
@@ -1303,31 +692,31 @@ class Pipeline:
                 self.detection_process.terminate()
                 self.detection_process.join(timeout=5.0)
             logger.info("Detection subprocess stopped")
-        
+
         if self.detection_thread:
             self.detection_thread.join(timeout=30.0)
             logger.info("Detection thread stopped")
-        
+
         if self.classification_thread:
             self.classification_thread.join(timeout=30.0)
             logger.info("Classification thread stopped")
-        
+
         logger.info("Pipeline stopped cleanly")
-    
+
     def wait(self) -> None:
         """Wait for pipeline (blocks until stopped)."""
         # Wait for recorder to finish (if running)
         if self.recorder_thread:
             self.recorder_thread.join()
-        
+
         # Wait for detection subprocess to finish (if running)
         if self.detection_process:
             self.detection_process.join()
-        
+
         # Wait for detection thread to finish (if running)
         if self.detection_thread:
             self.detection_thread.join()
-        
+
         # Wait for classification thread to finish (if running)
         if self.classification_thread:
             self.classification_thread.join()
@@ -1337,25 +726,24 @@ def _detection_subprocess_entry(config, video_queue, stop_event, recording_stopp
     """Spawned-subprocess entrypoint for the detection loop.
 
     Runs in its own interpreter (own GIL) so the GIL-heavy detection work cannot
-    starve the recorder threads in the parent process. Builds a detection-only
-    ``Pipeline`` that shares the recorder's video queue and stop/recording
-    events, then runs the detection worker loop. All outputs (crops, composites,
-    and the disk-based classification queue) are written to disk exactly as in
-    the in-process path, so detection results are unchanged.
+    starve the recorder threads in the parent process. Builds a standalone
+    ``Detector`` that shares the recorder's video queue and stop/recording
+    events, then runs its worker loop. All outputs (crops, composites, and the
+    disk-based classification queue) are written to disk exactly as in the
+    in-process path, so detection results are unchanged.
     """
     try:
         setup_logging(Path(config["paths"]["logs_dir"]))
     except Exception:
         logging.basicConfig(level=logging.INFO)
     logger.info("Detection subprocess starting")
-    detector = Pipeline(
+    detector = Detector(
         config,
-        detection_child=True,
-        shared_video_queue=video_queue,
-        shared_stop_event=stop_event,
-        shared_recording_stopped=recording_stopped,
+        video_queue=video_queue,
+        stop_event=stop_event,
+        recording_stopped=recording_stopped,
     )
     try:
-        detector._detection_worker()
+        detector.run()
     finally:
         logger.info("Detection subprocess exiting")

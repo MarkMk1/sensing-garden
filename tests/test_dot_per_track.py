@@ -99,21 +99,21 @@ def test_dot_empty_track_deleted_no_upload(tmp_path):
 # Criterion 4 — videos. Detection (subprocess) enqueues a "video" task to the disk
 # queue; the main-process worker ships it as kind="video" and drops the local copy.
 def test_dot_media_enqueues_video_task(tmp_path):
-    from bugcam.edge26.main import Pipeline
+    from bugcam.edge26.detector import Detector
     from bugcam.edge26.queue import ClassificationQueue
 
     _, out = _pollen(tmp_path)
-    pipe = Pipeline.__new__(Pipeline)
-    pipe.results_dir = out
-    pipe.dot_ids = ["dot1"]
-    pipe.classification_queue = ClassificationQueue(tmp_path / "pending")
+    det = Detector.__new__(Detector)
+    det.results_dir = out
+    det.dot_ids = ["dot1"]
+    det.classification_queue = ClassificationQueue(tmp_path / "pending")
     dot_in = tmp_path / "input" / "dot1_20260204"
     (dot_in / "videos").mkdir(parents=True)
     (dot_in / "videos" / "DOT_20260204_120453.mp4").write_bytes(b"vid")
 
-    pipe._process_dot_media(dot_in)
+    det._process_dot_media(dot_in)
 
-    entries = pipe.classification_queue.get_pending_entries()
+    entries = det.classification_queue.get_pending_entries()
     assert len(entries) == 1
     _, entry = entries[0]
     assert entry.entry_type == "video"

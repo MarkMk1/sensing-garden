@@ -77,7 +77,7 @@ def test_dot_done_signal_processing_uses_existing_track_crops(tmp_path: Path) ->
                 "output": {"results_dir": str(output_dir)},
             }
         )
-        pipeline._process_dot_directory_detection(input_dir / "dot01_20260417")
+        pipeline.detector._process_dot_directory_detection(input_dir / "dot01_20260417")
 
     # Verify track was queued for classification
     assert pipeline.classification_queue.count() == 1
