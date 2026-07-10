@@ -15,6 +15,7 @@ from bugcam.edge26.capture import VideoRecorder
 from bugcam.edge26.processing import VideoProcessor, HailoClassifier
 from bugcam.edge26.output import ResultsWriter
 from bugcam.edge26.queue import ClassificationQueue, QueueEntry
+from bugcam.edge26.result_health import audit_result_dir
 from bugcam.log_shipping import DailyLogHandler, ship_existing_logs
 
 # Producer-owned utility dirs under a device dir, not per-timestamp result
@@ -225,6 +226,23 @@ class Pipeline:
             bitrate=capture.get("bitrate", 20_000_000),
         )
     
+    def _audit_finalized_dir(self, output_dir: Path) -> None:
+        """Sanity-check a dir at the moment .done lands; one error line if unhealthy.
+
+        A .done marker only proves the completion counter reached the expected
+        count -- not that classification produced a sane result. Single
+        greppable prefix so the log ingestion side can alert on it.
+        """
+        try:
+            problems = audit_result_dir(output_dir)
+        except Exception:
+            logger.warning("result health audit failed for %s", output_dir, exc_info=True)
+            return
+        if problems:
+            logger.error("unhealthy result %s: %s", output_dir, "; ".join(problems))
+        else:
+            logger.debug(f"result health OK: {output_dir.name}")
+
     def _notify_result_ready(self, output_dir: Path) -> None:
         # Tell the upload owner (Pollen) a result dir is finalized, if wired.
         if self._on_result_ready is None:
@@ -754,6 +772,7 @@ class Pipeline:
                 self.writer.write_results(results=empty_results, output_dir=output_dir)
                 (output_dir / ".done").write_text("classified=0\nexpected=0\n")
                 logger.info("  No confirmed tracks, marked directory done")
+                self._audit_finalized_dir(output_dir)
                 self._notify_result_ready(output_dir)
 
         except Exception as e:
@@ -1202,6 +1221,7 @@ class Pipeline:
             completed_path.unlink(missing_ok=True)
             detection_meta_path = output_dir / ".detection.json"
             detection_meta_path.unlink(missing_ok=True)
+            self._audit_finalized_dir(output_dir)
             self._notify_result_ready(output_dir)
     
     def _maybe_sweep_stale_directories(self) -> None:
@@ -1280,6 +1300,7 @@ class Pipeline:
                         if age_seconds > stale_threshold_seconds:
                             done_path.write_text("swept=stale\n")
                             logger.info(f"Swept stale directory: {output_dir.name} (no .expected_tracks, marked done)")
+                            self._audit_finalized_dir(output_dir)
                             # Nothing scans for .done markers -- publishing only
                             # happens through this callback, so fire it or the
                             # rescue is a dead letter.
@@ -1316,6 +1337,7 @@ class Pipeline:
                                 )
                             done_path.write_text(f"swept=stale\ncompleted={completed}\nexpected={expected}\n")
                             logger.info(f"Swept stale directory: {output_dir.name} ({completed}/{expected} completed, no .done)")
+                            self._audit_finalized_dir(output_dir)
                             self._notify_result_ready(output_dir)
                             rescued += 1
                         else:
