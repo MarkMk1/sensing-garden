@@ -28,10 +28,13 @@ from bugcam.pollen.transport import DEFAULT_MULTIPART_THRESHOLD, DEFAULT_PART_SI
 logger = logging.getLogger("bugcam.pollen")
 
 ARCHIVE_KIND = "archive"
-# Kinds that are uploaded individually even in batch mode: large, un-indexed artifacts
-# (videos) would otherwise push a per-device tar past the multipart threshold and trap
-# the small result data inside a slow/stuck multipart upload.
-UNBATCHED_KINDS = frozenset({"video"})
+HEARTBEAT_KIND = "heartbeat"
+# Kinds that are uploaded individually even in batch mode. Videos: large, un-indexed
+# artifacts that would push a per-device tar past the multipart threshold and trap the
+# small result data inside a slow/stuck multipart upload. Heartbeats: liveness signals
+# that must reach the backend within their staleness threshold — an hourly tar would
+# put a ~2 h floor under dead-device detection (SPEC-fleet-monitoring item 1).
+UNBATCHED_KINDS = frozenset({"video", HEARTBEAT_KIND})
 MAX_RETRY_DELAY_SECONDS = 300  # matches the legacy upload loop
 STUCK_WARN_SECONDS = 3600      # warn loudly once the oldest item has waited this long
 
@@ -54,6 +57,10 @@ class PollenConfig:
     part_size: int = DEFAULT_PART_SIZE
     batch: bool = False
     videos_per_tick: int = 10  # max un-batched videos per tick, so a backlog can't starve archives
+    # Between full polls, ship pending heartbeat rows on this cadence (0 disables).
+    # Liveness freshness must not wait for the batch poll: with hourly tars the
+    # backend would learn a device died up to an hour late.
+    heartbeat_ship_interval: float = 60.0
     delete_after_upload: bool = True
     retain_uploaded: bool = False  # keep a local copy (in retained/) after upload
     retention_by_kind: dict[str, KindPolicy] = field(default_factory=dict)  # per-kind override
@@ -245,10 +252,31 @@ class Pollen:
                 delay = min(self.config.poll_interval * (2 ** consecutive_failures), MAX_RETRY_DELAY_SECONDS)
                 logger.warning("pollen: %d upload(s) failed; backing off %ss", tick_failures, delay)
                 self._warn_if_stuck()
-                self._stop.wait(delay)
+                self._wait_shipping_heartbeats(delay)
             else:
                 consecutive_failures = 0
-                self._stop.wait(self.config.poll_interval)
+                self._wait_shipping_heartbeats(self.config.poll_interval)
+
+    def _wait_shipping_heartbeats(self, delay: float) -> None:
+        """Wait out the inter-tick delay, waking on ``heartbeat_ship_interval`` to
+        ship only heartbeat rows. Batching sets poll_interval to an hour — liveness
+        can't wait that long, and a heartbeat-only pass packs no tars, so the batch
+        cadence is untouched. Runs on the Pollen thread like every other upload."""
+        interval = self.config.heartbeat_ship_interval
+        if interval <= 0 or interval >= delay:
+            self._stop.wait(delay)
+            return
+        deadline = time.monotonic() + delay
+        while not self._stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._stop.wait(min(interval, remaining)):
+                return
+            try:
+                self._ship_pending_heartbeats()
+            except Exception:
+                logger.exception("heartbeat ship pass failed; next pass will retry")
 
     # ------------------------------------------------------------------ #
     # the work
@@ -307,12 +335,46 @@ class Pollen:
             )
             return False
 
+    def _ship_pending_heartbeats(self) -> int:
+        """Ship heartbeat rows flat, newest per device; drop the superseded rest.
+
+        Heartbeats are ~1 KB liveness signals the backend watchdog ages against a
+        minutes-scale threshold — only the newest per device carries information.
+        Older pending ones are deleted (queue can't grow during an outage, and a
+        recovery isn't spent uploading a history of stale beats). Runs at the top
+        of every batched tick and between polls (``heartbeat_ship_interval``),
+        always on the Pollen thread — the store has no cross-thread claim.
+        """
+        rows = [r for r in self.store.claim_pending() if r.kind == HEARTBEAT_KIND]
+        newest_by_device: dict[str, UploadRow] = {}
+        for row in rows:
+            device = self._device_of(row)
+            current = newest_by_device.get(device)
+            if current is None or row.id > current.id:
+                newest_by_device[device] = row
+        failures = 0
+        for row in rows:
+            keeper = newest_by_device[self._device_of(row)]
+            if row.id != keeper.id:
+                Path(row.staging_path).unlink(missing_ok=True)
+                self.store.delete(row.id)
+                continue
+        for row in newest_by_device.values():
+            if self._drop_if_lost(row):
+                continue
+            if not self._upload_one(row):
+                failures += 1
+        return failures
+
     def _upload_batched(self, pending: list[UploadRow]) -> int:
+        # Heartbeats ship FIRST: behind a slow multi-hundred-MB tar they would go
+        # stale for exactly as long as the upload struggles -- the one moment
+        # their freshness matters most.
+        failures = self._ship_pending_heartbeats()
         # Archive rows already in flight (e.g. from a previous failed tick) retry
         # directly; their members ride them, so they are excluded from re-packing.
         # A tar whose staged file is lost is dropped WITHOUT reserving: its members
         # become free to re-pack into a fresh tar this same tick.
-        failures = 0
         reserved: set[int] = set()
         for row in (r for r in pending if r.kind == ARCHIVE_KIND):
             if self._drop_if_lost(row):
@@ -367,7 +429,8 @@ class Pollen:
         def _video_order(r: UploadRow) -> tuple[int, int]:
             return (r.attempts, r.id)
         videos = sorted(
-            (r for r in members if r.kind in UNBATCHED_KINDS),
+            # Heartbeats are un-batched too but already shipped at the top of the tick.
+            (r for r in members if r.kind in UNBATCHED_KINDS and r.kind != HEARTBEAT_KIND),
             key=_video_order,
         )
         deferred = len(videos) - min(len(videos), self.config.videos_per_tick)

@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 import logging
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ from bugcam.receiver.tracker import PendingTrackTracker
 app = typer.Typer(help="Record, process, upload, and emit heartbeats", invoke_without_command=True, no_args_is_help=False)
 console = Console()
 HEARTBEAT_INTERVAL_SECONDS = 60
+HEARTBEAT_UPLOAD_INTERVAL_SECONDS = 300
 ENVIRONMENT_INTERVAL_SECONDS = 60
 PID_FILE_PATH = get_state_dir() / "bugcam.pid"
 logger = logging.getLogger(__name__)
@@ -50,17 +52,29 @@ def _heartbeat_loop(
     stop_event: threading.Event,
     pollen: Any = None,
     interval: float = HEARTBEAT_INTERVAL_SECONDS,
+    upload_interval: float = HEARTBEAT_UPLOAD_INTERVAL_SECONDS,
 ) -> None:
+    # Snapshot cadence and upload cadence are decoupled (SPEC-fleet-monitoring
+    # item 1): snapshots stay minutely, but only every upload_interval-th one is
+    # enqueued -- pollen ships heartbeats flat, outside the archive tars, and the
+    # backend watchdog ages the latest heartbeat against ~3x this interval, so
+    # per-minute PUTs buy no detection and re-add the request costs batching kills.
+    next_upload = time.monotonic()  # the first snapshot ships immediately
+    held: Path | None = None  # newest snapshot not yet enqueued
     while not stop_event.is_set():
         path = write_heartbeat_snapshot(output_dir, flick_id, input_dir, dot_ids)
         if pollen is not None:
-            # Heartbeats are telemetry, not durable artifacts; shipped through the
-            # spooler for now, though file-vs-real-time-POST delivery is still open.
-            try:
-                pollen.enqueue_set([path], device=flick_id, kind="heartbeat")  # staged; our copy is done
-                path.unlink(missing_ok=True)
-            except Exception:
-                logger.exception("heartbeat enqueue failed (will retry next interval): %s", path.name)
+            if held is not None:
+                held.unlink(missing_ok=True)  # superseded before it ever shipped
+            held = path
+            if time.monotonic() >= next_upload:
+                try:
+                    pollen.enqueue_set([path], device=flick_id, kind="heartbeat")  # staged; our copy is done
+                    path.unlink(missing_ok=True)
+                    held = None
+                    next_upload = time.monotonic() + upload_interval
+                except Exception:
+                    logger.exception("heartbeat enqueue failed (will retry next snapshot): %s", path.name)
         stop_event.wait(interval)
 
 
@@ -230,6 +244,7 @@ def _resolve_pollen_settings(archive_batch: bool | None, upload_poll: int) -> di
         "multipart_threshold": int(cfg.get("upload_multipart_threshold", DEFAULT_MULTIPART_THRESHOLD)),
         "part_size": int(cfg.get("upload_part_size", DEFAULT_PART_SIZE)),
         "videos_per_tick": int(cfg.get("upload_videos_per_tick", 1)),
+        "heartbeat_ship_interval": float(cfg.get("upload_heartbeat_ship_interval", 60.0)),
     }
 
 
@@ -238,6 +253,13 @@ def _resolve_heartbeat_interval(heartbeat_interval: float | None) -> float:
     if heartbeat_interval is not None:
         return float(heartbeat_interval)
     return float(load_config().get("heartbeat_interval", HEARTBEAT_INTERVAL_SECONDS))
+
+
+def _resolve_heartbeat_upload_interval(heartbeat_upload_interval: float | None) -> float:
+    """Resolve the heartbeat upload cadence: CLI flag wins, then config, then default."""
+    if heartbeat_upload_interval is not None:
+        return float(heartbeat_upload_interval)
+    return float(load_config().get("heartbeat_upload_interval", HEARTBEAT_UPLOAD_INTERVAL_SECONDS))
 
 
 @app.callback()
@@ -258,6 +280,7 @@ def run(
     bucket: str | None = typer.Option(None, "--bucket", help="Configured output bucket"),
     upload_poll: int = typer.Option(3600, "--upload-poll", help="Seconds between upload polls; with --archive-batch this is also the batch cadence (one tar per device per poll) (config: upload_poll_interval)"),
     heartbeat_interval: float | None = typer.Option(None, "--heartbeat-interval", help="Seconds between heartbeat snapshots (config: heartbeat_interval, default 60)"),
+    heartbeat_upload_interval: float | None = typer.Option(None, "--heartbeat-upload-interval", help="Seconds between heartbeat uploads, decoupled from batching (config: heartbeat_upload_interval, default 300)"),
     with_receiver: bool = typer.Option(
         True,
         "--with-receiver/--no-receiver",
@@ -311,6 +334,7 @@ def run(
 
         settings = _resolve_runtime_settings(api_url, api_key, flick_id, dot_ids, bucket, enable_upload=enable_upload)
         resolved_heartbeat_interval = _resolve_heartbeat_interval(heartbeat_interval)
+        resolved_heartbeat_upload_interval = _resolve_heartbeat_upload_interval(heartbeat_upload_interval)
         input_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -329,6 +353,7 @@ def run(
                 part_size=pollen_settings["part_size"],
                 batch=pollen_settings["batch"],
                 videos_per_tick=pollen_settings["videos_per_tick"],
+                heartbeat_ship_interval=pollen_settings["heartbeat_ship_interval"],
                 delete_after_upload=delete_after_upload,
             )
             console.print(f"[dim]Upload[/dim] enabled (batch={pollen_settings['batch']})")
@@ -412,6 +437,7 @@ def run(
                 heartbeat_stop_event,
                 pollen_instance,
                 resolved_heartbeat_interval,
+                resolved_heartbeat_upload_interval,
             ),
             daemon=True,
             name="BugCamHeartbeat",

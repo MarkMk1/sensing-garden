@@ -16,11 +16,12 @@ class TestResolveSettings:
         mocker.patch.object(run, "load_config", return_value={
             "archive_batch": True,
             "upload_poll_interval": 5, "upload_multipart_threshold": 111, "upload_part_size": 222,
-            "upload_videos_per_tick": 3,
+            "upload_videos_per_tick": 3, "upload_heartbeat_ship_interval": 30,
         })
         s = run._resolve_pollen_settings(None, upload_poll=30)
         assert s == {"batch": True, "poll_interval": 5.0,
-                     "multipart_threshold": 111, "part_size": 222, "videos_per_tick": 3}
+                     "multipart_threshold": 111, "part_size": 222, "videos_per_tick": 3,
+                     "heartbeat_ship_interval": 30.0}
 
     def test_defaults(self, mocker):
         mocker.patch.object(run, "load_config", return_value={})
