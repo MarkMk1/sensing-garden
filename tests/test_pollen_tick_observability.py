@@ -116,6 +116,25 @@ class TestFailureLogging:
         )
 
 
+# --- spec: archive uploads log MB/s the same as unbatched uploads -----------
+
+class TestArchiveUploadSpeedLogging:
+    def test_archive_upload_logs_mb_and_mb_per_s(self, tmp_path, caplog):
+        cfg = _config(tmp_path, batch=True)
+        pol = _pollen(cfg, archiver=TarArchiver(), clock=TickClock())
+        path = _write(cfg.output_root, "flick1/c/results.json", b"x" * 1000)
+        pol.enqueue_set([path], device="flick1", kind="result")
+
+        with caplog.at_level(logging.INFO):
+            pol._tick()
+
+        uploaded = [m for m in _messages(caplog) if m.startswith("uploaded v2/archives/")]
+        assert uploaded, "expected an 'uploaded v2/archives/...' log line"
+        assert any("MB/s" in m for m in uploaded), (
+            f"archive upload line missing MB/s (archive row.size not populated): {uploaded}"
+        )
+
+
 # --- spec 5 / V2: cleanup always runs, even when the tick aborts -------------
 
 class TestCleanupAlwaysRuns:

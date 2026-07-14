@@ -392,7 +392,7 @@ class Pollen:
                 continue
             tar_id = self.store.enqueue(
                 str(artifact.path), kind=ARCHIVE_KIND, s3_key=artifact.s3_key,
-                metadata={"members": [item.id for item in items]},
+                metadata={"members": [item.id for item in items]}, size=artifact.size,
             )
             if tar_id is None:
                 logger.info("archive %s already queued; skipping re-enqueue", artifact.s3_key)
