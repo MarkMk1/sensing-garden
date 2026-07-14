@@ -54,6 +54,7 @@ class VideoRecorder:
         recording_mode: str = "continuous",
         interval_minutes: float = 5,
         bitrate: int = 20_000_000,
+        on_chunk_complete=None,
     ):
         """
         Initialize the video recorder.
@@ -70,6 +71,8 @@ class VideoRecorder:
             recording_mode: "continuous" (no gaps) or "interval" (record every N minutes)
             interval_minutes: Minutes between start of recordings (interval mode only)
             bitrate: H.264 encoder bitrate in bps (picamera2 hardware encoding only)
+            on_chunk_complete: Callback (path, duration_seconds) invoked for every
+                completed chunk, e.g. to log sampling effort
         """
         self.output_dir = Path(output_dir)
         self.fps = fps
@@ -82,7 +85,8 @@ class VideoRecorder:
         self.recording_mode = recording_mode
         self.interval_minutes = interval_minutes
         self.bitrate = bitrate
-        
+        self.on_chunk_complete = on_chunk_complete
+
         # Resolution is requested from config and confirmed during init.
         self.resolution: Tuple[int, int] = (0, 0)
         
@@ -340,6 +344,7 @@ class VideoRecorder:
         logger.info(f"Recording chunk: {chunk_path.name}")
 
         try:
+            recording_started = time.monotonic()
             self.camera.start_recording(
                 self.encoder,
                 str(temp_h264),
@@ -351,6 +356,8 @@ class VideoRecorder:
                 time.sleep(0.1)
 
             self.camera.stop_recording()
+            # Measured, not nominal: an early stop shortens the chunk.
+            recorded_seconds = time.monotonic() - recording_started
 
             if self.stop_event.is_set() and not temp_h264.exists():
                 return None
@@ -373,6 +380,7 @@ class VideoRecorder:
                     f"Chunk complete: {chunk_path.name} "
                     f"(hw encoded, {size_mb:.1f}MB)"
                 )
+                self._notify_chunk_complete(chunk_path, recorded_seconds)
                 return chunk_path
 
             return None
@@ -438,10 +446,21 @@ class VideoRecorder:
                 f"Chunk complete: {chunk_path.name} "
                 f"({frames_written} frames, {actual_duration:.1f}s, {size_mb:.1f}MB)"
             )
+            self._notify_chunk_complete(chunk_path, actual_duration)
             return chunk_path
         
         return None
     
+    def _notify_chunk_complete(self, chunk_path: Path, duration_seconds: float) -> None:
+        """Report a completed chunk to the consumer; its failures must never
+        break the recording loop."""
+        if self.on_chunk_complete is None:
+            return
+        try:
+            self.on_chunk_complete(chunk_path, duration_seconds)
+        except Exception:
+            logger.error(f"on_chunk_complete callback failed for {chunk_path.name}", exc_info=True)
+
     def start(self) -> None:
         """
         Start video recording (continuous or interval).

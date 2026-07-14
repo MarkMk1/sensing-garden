@@ -20,7 +20,7 @@ from bugcam.log_shipping import DailyLogHandler, ship_existing_logs
 # Producer-owned utility dirs under a device dir, not per-timestamp result
 # directories -- the sweep and inventory must never treat them as results
 # (rmtree'ing one races its live writer, e.g. the heartbeat loop).
-NON_RESULT_SUBDIRS = {"heartbeats", "environment", "logs"}
+NON_RESULT_SUBDIRS = {"heartbeats", "environment", "logs", "captures"}
 
 
 def setup_logging(log_dir: Path, *, on_log_complete=None) -> None:
@@ -83,10 +83,12 @@ class Pipeline:
         shared_recording_stopped=None,
         on_result_ready=None,
         on_video_ready=None,
+        on_chunk_recorded=None,
     ):
         self.config = config
         self._on_result_ready = on_result_ready
         self._on_video_ready = on_video_ready
+        self._on_chunk_recorded = on_chunk_recorded
 
         # --- Pipeline mode (resolved early; queue/event types depend on it) ---
         pipeline_config = config.get("pipeline", {})
@@ -223,6 +225,7 @@ class Pipeline:
             recording_mode=pipeline_cfg.get("recording_mode", "continuous"),
             interval_minutes=pipeline_cfg.get("recording_interval_minutes", 5),
             bitrate=capture.get("bitrate", 20_000_000),
+            on_chunk_complete=self._on_chunk_recorded,
         )
     
     def _notify_result_ready(self, output_dir: Path) -> None:
@@ -1266,7 +1269,7 @@ class Pipeline:
         # Producer-owned utility dirs, not per-timestamp result directories -- treating
         # them the same risked shutil.rmtree racing a live writer (e.g. the heartbeat
         # loop) that finds its own directory briefly empty and mid-write.
-        NON_RESULT_SUBDIRS = {"heartbeats", "environment", "logs"}
+        NON_RESULT_SUBDIRS = {"heartbeats", "environment", "logs", "captures"}
         # Per-pass tallies: one summary line per sweep makes stuck-state growth
         # visible in the daily log without scanning the disk by hand.
         scanned = 0
