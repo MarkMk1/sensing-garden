@@ -83,3 +83,5 @@ class PipelineMetrics:
         self.detection = StageTimings(ctx)
         self.classification = StageTimings(ctx)
         self.unhealthy_results = EventCounter(ctx)
+        self.remux = StageTimings(ctx)
+        self.remux_timeouts = EventCounter(ctx)

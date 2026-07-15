@@ -11,6 +11,7 @@ import typer
 from rich.console import Console
 
 from bugcam.config import get_input_storage_dir, get_output_storage_dir, load_config, parse_dot_ids
+from bugcam.storage_io import read_storage_io_stats as _read_storage_io_stats
 
 app = typer.Typer(help="Write a heartbeat snapshot", invoke_without_command=True, no_args_is_help=False)
 console = Console()
@@ -91,6 +92,7 @@ def build_heartbeat_payload(
         "cpu_temperature_celsius": _read_cpu_temperature_celsius(),
         "storage_free_bytes": disk_usage.free,
         "storage_total_bytes": disk_usage.total,
+        "storage_io": _read_storage_io_stats(input_dir),
         "uptime_seconds": _read_uptime_seconds(),
         "dot_status": _build_dot_status(input_dir, dot_ids),
         "incoming": _build_incoming_status(input_dir, flick_id, dot_ids),

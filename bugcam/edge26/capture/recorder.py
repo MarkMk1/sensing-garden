@@ -70,6 +70,7 @@ class VideoRecorder:
         bitrate: int = 20_000_000,
         record_window: Optional[RecordingWindow] = None,
         on_chunk_complete=None,
+        on_remux_complete=None,
     ):
         """
         Initialize the video recorder.
@@ -90,6 +91,9 @@ class VideoRecorder:
                 recorded (camera released, loop idles); None records around the clock
             on_chunk_complete: Callback (path, duration_seconds) invoked for every
                 completed chunk, e.g. to log sampling effort
+            on_remux_complete: Callback (duration_seconds, timed_out) invoked for
+                every ffmpeg remux attempt (success or failure), e.g. to report
+                remux health through the heartbeat
         """
         self.output_dir = Path(output_dir)
         self.fps = fps
@@ -104,6 +108,7 @@ class VideoRecorder:
         self.bitrate = bitrate
         self.record_window = record_window
         self.on_chunk_complete = on_chunk_complete
+        self.on_remux_complete = on_remux_complete
 
         # Resolution is requested from config and confirmed during init.
         self.resolution: Tuple[int, int] = (0, 0)
@@ -320,32 +325,65 @@ class VideoRecorder:
         except Exception:
             return False
 
+    @staticmethod
+    def _ionice_prefix() -> list:
+        """Best-effort I/O scheduling priority for the remux subprocess, so it
+        competes favorably against concurrent upload/archive writes to the
+        same device. No-op if ionice isn't installed (not all deployments
+        have util-linux's ionice)."""
+        if shutil.which("ionice"):
+            return ["ionice", "-c2", "-n0"]
+        return []
+
+    def _notify_remux_complete(self, duration_seconds: float, timed_out: bool) -> None:
+        """Report one remux attempt to the consumer; its failures must never
+        break the recording loop."""
+        if self.on_remux_complete is None:
+            return
+        try:
+            self.on_remux_complete(duration_seconds, timed_out)
+        except Exception:
+            logger.error("on_remux_complete callback failed", exc_info=True)
+
     def _remux_chunk(self, src: Path, dst: Path) -> bool:
         """Remux raw H.264 to MP4 container. Returns True on success."""
+        command = self._ionice_prefix() + [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", str(src),
+            "-c", "copy",
+            "-r", str(self.fps),
+            str(dst),
+        ]
+        started = time.monotonic()
         try:
             result = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-i", str(src),
-                    "-c", "copy",
-                    "-r", str(self.fps),
-                    str(dst),
-                ],
+                command,
                 capture_output=True,
                 text=True,
                 timeout=30,
             )
-            if result.returncode == 0:
-                src.unlink(missing_ok=True)
-                return True
-            logger.error(f"Remux failed: {result.stderr}")
-            return False
         except FileNotFoundError:
+            # ffmpeg itself (not ionice) missing: _check_ffmpeg_available()
+            # already gates this path, so no attempt was actually made.
             logger.warning("ffmpeg not found, using raw H.264 file")
+            return False
+        except subprocess.TimeoutExpired as e:
+            logger.error(f"Remux error: {e}")
+            self._notify_remux_complete(time.monotonic() - started, timed_out=True)
             return False
         except Exception as e:
             logger.error(f"Remux error: {e}")
+            self._notify_remux_complete(time.monotonic() - started, timed_out=False)
             return False
+
+        elapsed = time.monotonic() - started
+        if result.returncode == 0:
+            src.unlink(missing_ok=True)
+            self._notify_remux_complete(elapsed, timed_out=False)
+            return True
+        logger.error(f"Remux failed: {result.stderr}")
+        self._notify_remux_complete(elapsed, timed_out=False)
+        return False
 
     def _record_chunk_hardware(self) -> Optional[Path]:
         """
@@ -404,7 +442,15 @@ class VideoRecorder:
             if has_ffmpeg:
                 remuxed = self._remux_chunk(temp_h264, chunk_path)
                 if not remuxed:
-                    temp_h264.rename(chunk_path)
+                    # Leave the raw H.264 bytes under their correct .h264
+                    # extension rather than renaming to .mp4 -- a failed or
+                    # timed-out remux means dst was never written as a valid
+                    # container, so relabeling it would mislead downstream
+                    # consumers expecting a real MP4.
+                    chunk_path = temp_h264
+                    logger.warning(
+                        f"Chunk saved as raw H.264 after remux failure: {chunk_path.name}"
+                    )
             else:
                 temp_h264.rename(chunk_path)
                 logger.warning(

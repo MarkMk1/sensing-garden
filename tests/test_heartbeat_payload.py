@@ -9,6 +9,7 @@ from bugcam.commands import heartbeat as hb
 def _fake_system_reads(monkeypatch):
     monkeypatch.setattr(hb, "_read_cpu_temperature_celsius", lambda: 42.0)
     monkeypatch.setattr(hb, "_read_uptime_seconds", lambda: 100.0)
+    monkeypatch.setattr(hb, "_read_storage_io_stats", lambda path: None)
 
 
 def _payload(input_dir, **kwargs):
@@ -50,6 +51,29 @@ class TestIncoming:
             "dot_dirs": 0,
             "ready_dot_tracks": 0,
         }
+
+
+class TestStorageIO:
+    def test_included_when_available(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            hb, "_read_storage_io_stats",
+            lambda path: {"device": "/dev/sda1", "io_ms": 123},
+        )
+        payload = _payload(tmp_path)
+        assert payload["storage_io"] == {"device": "/dev/sda1", "io_ms": 123}
+
+    def test_none_when_unavailable(self, tmp_path):
+        payload = _payload(tmp_path)
+        assert payload["storage_io"] is None
+
+    def test_probed_against_input_dir(self, tmp_path, monkeypatch):
+        seen = []
+        monkeypatch.setattr(
+            hb, "_read_storage_io_stats",
+            lambda path: seen.append(path) or None,
+        )
+        _payload(tmp_path)
+        assert seen == [tmp_path]
 
 
 class TestOptionalSections:

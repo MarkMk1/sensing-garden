@@ -256,8 +256,17 @@ class Pipeline:
                 pipeline_cfg.get("record_window"), self.timezone_name
             ),
             on_chunk_complete=self._on_chunk_recorded,
+            on_remux_complete=self._on_remux_complete,
         )
-    
+
+    def _on_remux_complete(self, duration_seconds: float, timed_out: bool) -> None:
+        """Record one ffmpeg remux attempt (success or failure) for the
+        heartbeat -- distinguishing timeouts from other failures surfaces
+        I/O-contention stalls separately from e.g. ffmpeg rejecting input."""
+        self.metrics.remux.record(duration_seconds)
+        if timed_out:
+            self.metrics.remux_timeouts.increment()
+
     def _audit_finalized_dir(self, output_dir: Path) -> None:
         """Sanity-check a dir at the moment .done lands; one error line if unhealthy.
 
@@ -1512,6 +1521,8 @@ class Pipeline:
             "detection": self.metrics.detection.snapshot(reset=reset),
             "classification": self.metrics.classification.snapshot(reset=reset),
             "unhealthy_results": self.metrics.unhealthy_results.value,
+            "remux": self.metrics.remux.snapshot(reset=reset),
+            "remux_timeouts": self.metrics.remux_timeouts.value,
         }
 
     def _status_loop(self) -> None:

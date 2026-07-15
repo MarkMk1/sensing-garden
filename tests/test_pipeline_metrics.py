@@ -92,6 +92,8 @@ class TestPipelineHealthSnapshot:
         pipeline.metrics.detection.record(2.0)
         pipeline.metrics.classification.record(0.5)
         pipeline.metrics.unhealthy_results.increment()
+        pipeline.metrics.remux.record(1.5)
+        pipeline.metrics.remux_timeouts.increment()
 
         snap = pipeline.health_snapshot()
 
@@ -101,6 +103,9 @@ class TestPipelineHealthSnapshot:
         assert snap["detection"]["max_seconds"] == pytest.approx(2.0)
         assert snap["classification"]["count"] == 1
         assert snap["unhealthy_results"] == 1
+        assert snap["remux"]["count"] == 1
+        assert snap["remux"]["max_seconds"] == pytest.approx(1.5)
+        assert snap["remux_timeouts"] == 1
         assert snap["workers"] == {}  # nothing started
         # Process-lifetime uptime: resets on a service restart, unlike the
         # system uptime in the base payload, so crash-loops are visible.
