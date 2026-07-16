@@ -203,6 +203,7 @@ def test_heartbeat_payload_includes_timezone(tmp_path: Path, monkeypatch) -> Non
 
     monkeypatch.setattr(heartbeat, "_read_cpu_temperature_celsius", lambda: 42.0)
     monkeypatch.setattr(heartbeat, "_read_uptime_seconds", lambda: 100.0)
+    monkeypatch.setattr(heartbeat, "_read_network_usage", lambda: [])
     payload = heartbeat.build_heartbeat_payload(
         "flick-test", tmp_path, [], timezone_name="America/Toronto"
     )

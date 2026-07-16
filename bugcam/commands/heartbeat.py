@@ -15,6 +15,8 @@ from bugcam.config import get_input_storage_dir, get_output_storage_dir, load_co
 app = typer.Typer(help="Write a heartbeat snapshot", invoke_without_command=True, no_args_is_help=False)
 console = Console()
 
+_PROC_NET_DEV_PATH = Path("/proc/net/dev")
+
 
 def _read_cpu_temperature_celsius() -> float:
     raw_value = Path("/sys/class/thermal/thermal_zone0/temp").read_text(encoding="utf-8").strip()
@@ -24,6 +26,34 @@ def _read_cpu_temperature_celsius() -> float:
 def _read_uptime_seconds() -> float:
     raw_value = Path("/proc/uptime").read_text(encoding="utf-8").split()[0]
     return float(raw_value)
+
+
+def _read_network_usage() -> list[dict[str, object]]:
+    """Cumulative rx/tx byte counters per network interface, excluding loopback.
+    Returns [] if /proc/net/dev is unavailable -- this is an informational
+    heartbeat field, not worth failing the heartbeat over."""
+    try:
+        lines = _PROC_NET_DEV_PATH.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    interfaces = []
+    for line in lines[2:]:  # skip the two header lines
+        if ":" not in line:
+            continue
+        name, _, rest = line.partition(":")
+        name = name.strip()
+        if name == "lo":
+            continue
+        fields = rest.split()
+        if len(fields) < 9:
+            continue
+        interfaces.append({
+            "interface": name,
+            "rx_bytes": int(fields[0]),
+            "tx_bytes": int(fields[8]),
+        })
+    return sorted(interfaces, key=lambda entry: entry["interface"])
 
 
 def _build_dot_status(input_dir: Path, dot_ids: list[str]) -> list[dict[str, str | None]]:
@@ -92,6 +122,7 @@ def build_heartbeat_payload(
         "storage_free_bytes": disk_usage.free,
         "storage_total_bytes": disk_usage.total,
         "uptime_seconds": _read_uptime_seconds(),
+        "network_interfaces": _read_network_usage(),
         "dot_status": _build_dot_status(input_dir, dot_ids),
         "incoming": _build_incoming_status(input_dir, flick_id, dot_ids),
     }

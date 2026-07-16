@@ -12,6 +12,7 @@ from bugcam.commands import run as run_mod
 def _fake_system_reads(monkeypatch):
     monkeypatch.setattr(hb, "_read_cpu_temperature_celsius", lambda: 42.0)
     monkeypatch.setattr(hb, "_read_uptime_seconds", lambda: 100.0)
+    monkeypatch.setattr(hb, "_read_network_usage", lambda: [])
 
 
 class FakePollen:
