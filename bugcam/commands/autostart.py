@@ -1,5 +1,6 @@
 import typer
 import subprocess
+import shutil
 import sys
 import os
 import re
@@ -36,11 +37,19 @@ WantedBy=multi-user.target
 """
 
 
-POETRY_PATH = "/home/pi/.local/bin/poetry"
-REPO_DIR = "/home/pi/sensing-garden"
-
 def _get_bugcam_path() -> str:
-    return f"{POETRY_PATH} --directory {REPO_DIR} run bugcam"
+    """Resolve the installed bugcam executable for use in the systemd unit.
+
+    bugcam is installed as a regular package (pip/pipx), so the service
+    should invoke it directly rather than going through poetry/a repo checkout.
+    """
+    bugcam_bin = shutil.which("bugcam")
+    if bugcam_bin is None:
+        raise RuntimeError(
+            "Could not find the 'bugcam' executable on PATH. "
+            "Install it with 'pip install bugcam' or 'pipx install bugcam'."
+        )
+    return bugcam_bin
 
 
 def _validate_model_name(model: str) -> bool:

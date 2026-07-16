@@ -134,6 +134,31 @@ class TestUsernameValidation:
         assert not _validate_username(""), "Empty string not rejected"
 
 
+class TestGetBugcamPath:
+    """Tests that the systemd unit invokes the installed bugcam executable, not poetry."""
+
+    @patch('bugcam.commands.autostart.shutil.which')
+    def test_resolves_installed_executable(self, mock_which) -> None:
+        from bugcam.commands.autostart import _get_bugcam_path
+
+        mock_which.return_value = "/home/pi/.local/bin/bugcam"
+
+        result = _get_bugcam_path()
+
+        assert result == "/home/pi/.local/bin/bugcam"
+        assert "poetry" not in result
+        mock_which.assert_called_once_with("bugcam")
+
+    @patch('bugcam.commands.autostart.shutil.which')
+    def test_raises_when_not_on_path(self, mock_which) -> None:
+        from bugcam.commands.autostart import _get_bugcam_path
+
+        mock_which.return_value = None
+
+        with pytest.raises(RuntimeError, match="bugcam"):
+            _get_bugcam_path()
+
+
 class TestAutostart:
     """Tests for autostart commands."""
 
