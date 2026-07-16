@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 import pytest
 
-from bugcam.edge26.metrics import PipelineMetrics, StageTimings
+from bugcam.edge26.metrics import StageTimings
 
 
 def _record_two(timings: StageTimings) -> None:
