@@ -23,6 +23,7 @@ class ArchiveArtifact:
     path: Path              # the staged archive file to upload
     s3_key: str             # where the archive is uploaded
     member_keys: list[str]  # the s3_keys bundled, to mark uploaded once shipped
+    size: int               # on-disk size of ``path``, for enqueueing and speed logging
 
 
 class Archiver(ABC):
@@ -76,4 +77,7 @@ class TarArchiver(Archiver):
         with tarfile.open(tar_path, "w") as tar:  # uncompressed -> valid member offsets
             for item in items:
                 tar.add(item.staging_path, arcname=item.s3_key)
-        return ArchiveArtifact(path=tar_path, s3_key=s3_key, member_keys=[it.s3_key for it in items])
+        return ArchiveArtifact(
+            path=tar_path, s3_key=s3_key, member_keys=[it.s3_key for it in items],
+            size=tar_path.stat().st_size,
+        )

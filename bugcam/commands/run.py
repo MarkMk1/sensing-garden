@@ -12,6 +12,7 @@ from typing import Any
 import typer
 from rich.console import Console
 
+from bugcam.capture_report import CAPTURES_SUBDIR, DEFAULT_REPORT_INTERVAL_SECONDS, CaptureLog
 from bugcam.commands.heartbeat import write_heartbeat_snapshot
 from bugcam.pollen.integration import build_pollen
 from bugcam.edge26.result_publish import publish_result_dir
@@ -29,6 +30,7 @@ from bugcam.commands.status import _check_time_sync
 from bugcam.device_config import resolve_flick_id
 from bugcam.environment_sensor import collect_environment_reading
 from bugcam.processing import parse_capture_resolution
+from bugcam.record_window import RecordingWindow
 from bugcam.runtime import build_pipeline, resolve_bundle_provenance, select_model_reference
 from bugcam.receiver import create_app
 from bugcam.receiver.config import RECEIVER_DEFAULT_PORT, RECEIVER_DEFAULT_HOST
@@ -36,10 +38,59 @@ from bugcam.receiver.tracker import PendingTrackTracker
 
 app = typer.Typer(help="Record, process, upload, and emit heartbeats", invoke_without_command=True, no_args_is_help=False)
 console = Console()
-HEARTBEAT_INTERVAL_SECONDS = 60
+HEARTBEAT_INTERVAL_SECONDS = 300
 ENVIRONMENT_INTERVAL_SECONDS = 60
 PID_FILE_PATH = get_state_dir() / "bugcam.pid"
 logger = logging.getLogger(__name__)
+
+
+def _emit_heartbeat(
+    flick_id: str,
+    input_dir: Path,
+    output_dir: Path,
+    dot_ids: list[str],
+    pollen: Any = None,
+    pipeline: Any = None,
+    timezone_name: str | None = None,
+) -> None:
+    """Write one enriched heartbeat and ship it.
+
+    Enrichment (pipeline health, upload stats) is best-effort -- a broken
+    section must never cost the heartbeat itself. Delivery is an immediate
+    PUT so heartbeats never wait on the spool/batch cadence, falling back to
+    the durable queue (priority kind, never archived) when the PUT fails."""
+    pipeline_status = upload_status = None
+    if pipeline is not None:
+        try:
+            pipeline_status = pipeline.health_snapshot()
+        except Exception:
+            logger.exception("pipeline health snapshot failed; heartbeat continues without it")
+    if pollen is not None:
+        try:
+            upload_status = pollen.stats()
+        except Exception:
+            logger.exception("upload stats failed; heartbeat continues without them")
+    path = write_heartbeat_snapshot(
+        output_dir, flick_id, input_dir, dot_ids,
+        pipeline_status=pipeline_status, upload_status=upload_status,
+        timezone_name=timezone_name,
+    )
+    if pollen is None:
+        return
+    try:
+        pollen.upload_path_now(path)
+        path.unlink(missing_ok=True)
+        return
+    except Exception as exc:
+        logger.warning(
+            "immediate heartbeat upload failed (%s: %s); spooling %s",
+            type(exc).__name__, exc, path.name,
+        )
+    try:
+        pollen.enqueue_set([path], device=flick_id, kind="heartbeat")  # staged; our copy is done
+        path.unlink(missing_ok=True)
+    except Exception:
+        logger.exception("heartbeat enqueue failed (will retry next interval): %s", path.name)
 
 
 def _heartbeat_loop(
@@ -50,18 +101,50 @@ def _heartbeat_loop(
     stop_event: threading.Event,
     pollen: Any = None,
     interval: float = HEARTBEAT_INTERVAL_SECONDS,
+    pipeline: Any = None,
+    timezone_name: str | None = None,
 ) -> None:
     while not stop_event.is_set():
-        path = write_heartbeat_snapshot(output_dir, flick_id, input_dir, dot_ids)
-        if pollen is not None:
-            # Heartbeats are telemetry, not durable artifacts; shipped through the
-            # spooler for now, though file-vs-real-time-POST delivery is still open.
-            try:
-                pollen.enqueue_set([path], device=flick_id, kind="heartbeat")  # staged; our copy is done
-                path.unlink(missing_ok=True)
-            except Exception:
-                logger.exception("heartbeat enqueue failed (will retry next interval): %s", path.name)
+        try:
+            _emit_heartbeat(
+                flick_id, input_dir, output_dir, dot_ids,
+                pollen=pollen, pipeline=pipeline, timezone_name=timezone_name,
+            )
+        except Exception:
+            logger.exception("heartbeat emission failed (will retry next interval)")
         stop_event.wait(interval)
+
+
+def _capture_report_loop(
+    capture_log: CaptureLog,
+    flick_id: str,
+    stop_event: threading.Event,
+    pollen: Any = None,
+    interval: float = DEFAULT_REPORT_INTERVAL_SECONDS,
+) -> None:
+    """Seal and ship sampling-effort reports every ``interval`` seconds.
+
+    Reports ride the normal upload path (kind="capture" under the device's data
+    tree), so with --archive-batch each one lands in the per-device tar next to
+    the results it describes. Without pollen, reports accumulate locally, like
+    heartbeats."""
+
+    def _ship(report_path: Path) -> None:
+        if pollen is None:
+            return
+        try:
+            pollen.enqueue_set([report_path], device=flick_id, kind="capture")  # staged; copy done
+            report_path.unlink(missing_ok=True)
+        except Exception:
+            logger.exception(
+                "capture report enqueue failed (kept; recovered next pass): %s", report_path.name
+            )
+
+    # A prior run's unsealed samples and unshipped reports go out first.
+    for leftover in capture_log.recover():
+        _ship(leftover)
+    while not stop_event.wait(interval):
+        _ship(capture_log.rotate())
 
 
 def _environment_loop(
@@ -240,6 +323,26 @@ def _resolve_heartbeat_interval(heartbeat_interval: float | None) -> float:
     return float(load_config().get("heartbeat_interval", HEARTBEAT_INTERVAL_SECONDS))
 
 
+def _resolve_recording_window(
+    timezone_name: str | None, record_window: str | None
+) -> tuple[str | None, str | None]:
+    """Resolve timezone and record window: CLI flag wins, then config.
+
+    Config-file keys: timezone (IANA name), record_window ("HH:MM-HH:MM" local
+    or "always").
+    """
+    cfg = load_config()
+    resolved_tz = timezone_name or str(cfg.get("timezone") or "") or None
+    resolved_window = record_window or str(cfg.get("record_window") or "") or None
+    return resolved_tz, resolved_window
+
+
+def _resolve_capture_report_interval() -> float:
+    """Sampling-report cadence (config: capture_report_interval). The default
+    matches the default --upload-poll, so one report per archive batch."""
+    return float(load_config().get("capture_report_interval", DEFAULT_REPORT_INTERVAL_SECONDS))
+
+
 @app.callback()
 def run(
     api_url: str | None = typer.Option(None, "--api-url", help="Backend API URL"),
@@ -257,7 +360,7 @@ def run(
     bitrate: int = typer.Option(20_000_000, "--bitrate", help="H.264 encoder bitrate in bps (hardware encoding only)"),
     bucket: str | None = typer.Option(None, "--bucket", help="Configured output bucket"),
     upload_poll: int = typer.Option(3600, "--upload-poll", help="Seconds between upload polls; with --archive-batch this is also the batch cadence (one tar per device per poll) (config: upload_poll_interval)"),
-    heartbeat_interval: float | None = typer.Option(None, "--heartbeat-interval", help="Seconds between heartbeat snapshots (config: heartbeat_interval, default 60)"),
+    heartbeat_interval: float | None = typer.Option(None, "--heartbeat-interval", help="Seconds between heartbeat snapshots (config: heartbeat_interval, default 300)"),
     with_receiver: bool = typer.Option(
         True,
         "--with-receiver/--no-receiver",
@@ -293,10 +396,30 @@ def run(
              "folder instead, processing injected videos/DOT dirs (inject with mv, "
              "not cp: a file mid-copy can be picked up truncated)",
     ),
+    timezone_name: str | None = typer.Option(
+        None,
+        "--timezone",
+        help="IANA timezone of the deployment site, e.g. Europe/London or "
+             "America/Toronto (config: timezone); localizes the record window "
+             "and day boundaries. Timestamps stay UTC.",
+    ),
+    record_window: str | None = typer.Option(
+        None,
+        "--record-window",
+        help="Daily local-time recording window 'HH:MM-HH:MM', or 'always' "
+             "(config: record_window). With a timezone configured the default "
+             "is 05:00-22:00; processing/uploading continues outside the window.",
+    ),
 ) -> None:
-    """Run recording, processing, uploading, and one-minute heartbeat emission."""
+    """Run recording, processing, uploading, and periodic heartbeat emission."""
     if mode not in {"continuous", "interval"}:
         raise typer.BadParameter("mode must be 'continuous' or 'interval'")
+    resolved_timezone, resolved_window = _resolve_recording_window(timezone_name, record_window)
+    try:
+        # Validate early so a config typo fails at launch, not mid-run.
+        window = RecordingWindow.from_config(resolved_window, resolved_timezone)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
     try:
         pid_path = _acquire_pid_file()
     except RuntimeError as exc:
@@ -345,7 +468,12 @@ def run(
             # on one bucket would overwrite each other.
             try:
                 manifest = json.dumps(
-                    {"flick_id": settings["flick_id"], "dot_ids": settings["dot_ids"]}, indent=2
+                    {
+                        "flick_id": settings["flick_id"],
+                        "dot_ids": settings["dot_ids"],
+                        "timezone": resolved_timezone,
+                    },
+                    indent=2,
                 ).encode("utf-8")
                 pollen_instance.upload_now(manifest, "v1/manifest.json", "application/json")
             except Exception as exc:  # noqa: BLE001
@@ -364,6 +492,9 @@ def run(
         if not record:
             console.print(f"[yellow]Recording disabled[/yellow] (--no-record); watching {input_dir} for injected input")
             logger.info("recording disabled for this run (--no-record); processing injected input only")
+        else:
+            console.print(f"[dim]Recording window[/dim] {window.describe()}")
+            logger.info("recording window: %s", window.describe())
 
         on_result_ready = None
         on_log_complete = None
@@ -379,6 +510,14 @@ def run(
             def on_log_complete(path: Path) -> None:  # ship a rolled-over log, then drop our copy
                 pollen_instance.enqueue_set([path], device=settings["flick_id"], kind="log")
                 path.unlink(missing_ok=True)
+
+        # Sampling-effort tracking only makes sense when the camera runs;
+        # injected input (--no-record) is not sampling.
+        capture_log = None
+        if record:
+            capture_log = CaptureLog(
+                output_dir / settings["flick_id"] / CAPTURES_SUBDIR, settings["flick_id"]
+            )
         pipeline = build_pipeline(
             flick_id=settings["flick_id"],
             dot_ids=settings["dot_ids"],
@@ -395,12 +534,16 @@ def run(
             enable_recording=record,
             watch_input=not record,
             detection_config_path=detection_config,
+            timezone_name=resolved_timezone,
+            record_window=resolved_window,
             on_result_ready=on_result_ready,
             on_log_complete=on_log_complete,
             on_video_ready=on_video_ready,
+            on_chunk_recorded=capture_log.record_chunk if capture_log else None,
         )
         heartbeat_stop_event = threading.Event()
         environment_stop_event = threading.Event()
+        capture_report_stop_event = threading.Event()
         receiver_stop_event = threading.Event()
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
@@ -412,6 +555,8 @@ def run(
                 heartbeat_stop_event,
                 pollen_instance,
                 resolved_heartbeat_interval,
+                pipeline,
+                resolved_timezone,
             ),
             daemon=True,
             name="BugCamHeartbeat",
@@ -427,6 +572,20 @@ def run(
             daemon=True,
             name="BugCamEnvironment",
         )
+        capture_report_thread = None
+        if capture_log is not None:
+            capture_report_thread = threading.Thread(
+                target=_capture_report_loop,
+                args=(
+                    capture_log,
+                    settings["flick_id"],
+                    capture_report_stop_event,
+                    pollen_instance,
+                    _resolve_capture_report_interval(),
+                ),
+                daemon=True,
+                name="BugCamCaptureReport",
+            )
 
         receiver_thread = None
         if with_receiver:
@@ -442,6 +601,8 @@ def run(
         pipeline.start()
         heartbeat_thread.start()
         environment_thread.start()
+        if capture_report_thread:
+            capture_report_thread.start()
         if receiver_thread:
             receiver_thread.start()
             console.print(f"[dim]Receiver[/dim] http://{receiver_host}:{receiver_port}")
@@ -456,12 +617,16 @@ def run(
             heartbeat_stop_event.set()
         if "environment_stop_event" in locals():
             environment_stop_event.set()
+        if "capture_report_stop_event" in locals():
+            capture_report_stop_event.set()
         if "receiver_stop_event" in locals() and receiver_thread:
             receiver_stop_event.set()
         if "heartbeat_thread" in locals():
             heartbeat_thread.join(timeout=1)
         if "environment_thread" in locals():
             environment_thread.join(timeout=1)
+        if "capture_report_thread" in locals() and capture_report_thread:
+            capture_report_thread.join(timeout=1)
         if "receiver_thread" in locals() and receiver_thread:
             receiver_thread.join(timeout=5)
         # Stop Pollen's loop after finishing the current tick; anything still
