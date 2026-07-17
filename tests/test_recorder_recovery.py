@@ -200,6 +200,76 @@ def test_interval_mode_failure_counts_and_escalates(tmp_path, monkeypatch):
     assert len(init_calls) == recorder_module.MAX_CONSECUTIVE_FAILURES
 
 
+def install_scripted_opencv(rec: VideoRecorder, behaviors: list) -> dict:
+    """Fake the legacy OpenCV path's per-iteration calls.
+
+    Each _record_chunk() call consumes the next behavior:
+      - "fail": raise RuntimeError (simulates a frame-grab/writer failure).
+      - "ok": write and return a fresh chunk path.
+      - "end" (implicit once the script runs out): write and return a fresh
+        chunk path, then set the recorder's stop_event so the loop terminates.
+
+    Returns call counters for _init_camera/_start_grabber, so a test can
+    assert whether a failure re-initialized the camera.
+    """
+    calls = {"init": 0, "grabber": 0}
+    script = iter(behaviors)
+    chunk_index = [0]
+
+    def fake_init():
+        calls["init"] += 1
+
+    def fake_grabber():
+        calls["grabber"] += 1
+
+    def fake_record_chunk():
+        action = next(script, "end")
+        if action == "fail":
+            raise RuntimeError("frame grab failed")
+        chunk_index[0] += 1
+        path = Path(rec.output_dir) / f"chunk{chunk_index[0]}.mp4"
+        path.write_bytes(b"data")
+        if action == "end":
+            rec.stop_event.set()
+        return path
+
+    rec._init_camera = fake_init
+    rec._start_grabber = fake_grabber
+    rec._record_chunk = fake_record_chunk
+    return calls
+
+
+def test_opencv_path_recovers_from_chunk_failure_instead_of_dying(tmp_path, monkeypatch):
+    """Before this fix, any exception in the OpenCV path's while-loop body was
+    caught by one blanket except around the whole loop, logged once, and the
+    loop exited for good -- no retry. It must instead recover like the
+    hardware path: teardown, backoff, re-init, keep recording."""
+    rec = make_recorder(tmp_path, use_picamera=False)
+    calls = install_scripted_opencv(rec, ["ok", "fail", "end"])
+    exit_mock = patched_exit(monkeypatch)
+
+    rec.start()
+
+    exit_mock.assert_not_called()
+    # Recovered and kept going: both the "ok" and "end" chunks landed.
+    assert len(list(tmp_path.glob("chunk*.mp4"))) == 2
+    # The failure forced a teardown + re-init before the next attempt.
+    assert calls["init"] == 2
+
+
+def test_opencv_path_escalates_after_max_consecutive_failures(tmp_path, monkeypatch):
+    rec = make_recorder(tmp_path, use_picamera=False)
+    calls = install_scripted_opencv(rec, ["fail"] * 10)
+    exit_mock = patched_exit(monkeypatch)
+
+    with pytest.raises(SystemExit):
+        rec.start()
+
+    exit_mock.assert_called_once()
+    assert exit_mock.call_args[0][0] != 0
+    assert calls["init"] == recorder_module.MAX_CONSECUTIVE_FAILURES
+
+
 class _OneShotEvent(threading.Event):
     """Event that records wait() timeouts and trips after the first wait."""
 
@@ -211,6 +281,29 @@ class _OneShotEvent(threading.Event):
         self.wait_timeouts.append(timeout)
         self.set()
         return True
+
+
+def test_finalize_disk_error_is_not_counted_as_camera_failure(tmp_path, monkeypatch):
+    """A rename/stat error after a successful start/stop_recording is a
+    filesystem hiccup, not a camera fault: it must not tear down or rebuild a
+    healthy camera, and must not count toward failure escalation."""
+    rec = make_recorder(tmp_path)
+    cameras = install_scripted_camera(rec, ["ok", "end"])
+    exit_mock = patched_exit(monkeypatch)
+    teardown_mock = MagicMock()
+    rec._teardown_for_recovery = teardown_mock
+
+    def failing_rename(self, target):
+        raise OSError("simulated disk write error")
+
+    monkeypatch.setattr(Path, "rename", failing_rename)
+
+    rec.start()
+
+    exit_mock.assert_not_called()
+    teardown_mock.assert_not_called()
+    # Only one camera ever created -- a finalize error didn't trigger a rebuild.
+    assert len(cameras) == 1
 
 
 def test_skipped_chunk_waits_instead_of_spinning(tmp_path, monkeypatch):

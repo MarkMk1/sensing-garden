@@ -399,26 +399,37 @@ class VideoRecorder:
         if self.stop_event.is_set() and not temp_h264.exists():
             return None
 
-        if temp_h264.exists():
-            has_ffmpeg = self._check_ffmpeg_available()
-            if has_ffmpeg:
-                remuxed = self._remux_chunk(temp_h264, chunk_path)
-                if not remuxed:
+        # A good recording already happened above; a remux/rename/stat error
+        # here is a filesystem hiccup (e.g. a flaky SD-card write), not a
+        # camera/encoder fault. Keep it out of the caller's failure counter --
+        # it must not tear down or rebuild a perfectly healthy camera.
+        try:
+            if temp_h264.exists():
+                has_ffmpeg = self._check_ffmpeg_available()
+                if has_ffmpeg:
+                    remuxed = self._remux_chunk(temp_h264, chunk_path)
+                    if not remuxed:
+                        temp_h264.rename(chunk_path)
+                else:
                     temp_h264.rename(chunk_path)
-            else:
-                temp_h264.rename(chunk_path)
-                logger.warning(
-                    f"Chunk saved as raw H.264 (no ffmpeg): {chunk_path.name}"
-                )
+                    logger.warning(
+                        f"Chunk saved as raw H.264 (no ffmpeg): {chunk_path.name}"
+                    )
 
-        if chunk_path.exists():
-            size_mb = chunk_path.stat().st_size / (1024 * 1024)
-            logger.info(
-                f"Chunk complete: {chunk_path.name} "
-                f"(hw encoded, {size_mb:.1f}MB)"
+            if chunk_path.exists():
+                size_mb = chunk_path.stat().st_size / (1024 * 1024)
+                logger.info(
+                    f"Chunk complete: {chunk_path.name} "
+                    f"(hw encoded, {size_mb:.1f}MB)"
+                )
+                self._notify_chunk_complete(chunk_path, recorded_seconds)
+                return chunk_path
+        except OSError:
+            logger.error(
+                f"Chunk finalize failed for {chunk_path.name} (disk error, not a camera fault)",
+                exc_info=True,
             )
-            self._notify_chunk_complete(chunk_path, recorded_seconds)
-            return chunk_path
+            return None
 
         return None
 
@@ -532,7 +543,9 @@ class VideoRecorder:
         """Record non-stop, chunk after chunk with no gaps.
 
         Outside the recording window the camera is released and the loop
-        idles; it re-initializes the camera when the window reopens.
+        idles; it re-initializes the camera when the window reopens. Camera
+        errors are recovered in place (teardown, backoff, retry) rather than
+        ending the loop -- see _run_continuous_hardware for why.
         """
         logger.info("Starting continuous recording...")
 
@@ -543,6 +556,7 @@ class VideoRecorder:
 
         # Legacy OpenCV path with frame grabber + queue
         camera_active = False
+        consecutive_failures = 0
         try:
             while not self.stop_event.is_set():
                 if not self._window_open():
@@ -553,21 +567,28 @@ class VideoRecorder:
                         break
                     continue
 
-                if not camera_active:
-                    self._init_camera()
-                    self._start_grabber()
-                    camera_active = True
+                try:
+                    if not camera_active:
+                        self._init_camera()
+                        self._start_grabber()
+                        camera_active = True
+                    chunk_path = self._record_chunk()
+                except Exception:
+                    if self.stop_event.is_set():
+                        break
+                    consecutive_failures = self._handle_recording_failure(
+                        consecutive_failures, "Recording"
+                    )
+                    camera_active = False
+                    continue
 
-                chunk_path = self._record_chunk()
                 if chunk_path:
+                    consecutive_failures = 0
                     self.last_chunk_path = chunk_path
                     if self.video_queue:
                         self.video_queue.put(chunk_path)
                 elif not self.stop_event.is_set():
                     self.stop_event.wait(NO_CHUNK_RETRY_SECONDS)
-
-        except Exception as e:
-            logger.error(f"Recording error: {e}", exc_info=True)
         finally:
             self._cleanup(final=True)
 
@@ -600,15 +621,9 @@ class VideoRecorder:
                 except Exception:
                     if self.stop_event.is_set():
                         break
-                    consecutive_failures += 1
-                    logger.error(
-                        f"Hardware recording failed (consecutive failure "
-                        f"{consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})",
-                        exc_info=True,
+                    consecutive_failures = self._handle_recording_failure(
+                        consecutive_failures, "Hardware recording"
                     )
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        self._fatal_exit()
-                    self._teardown_for_recovery()
                     continue
 
                 if chunk_path:
@@ -648,15 +663,9 @@ class VideoRecorder:
                 except Exception:
                     if self.stop_event.is_set():
                         break
-                    consecutive_failures += 1
-                    logger.error(
-                        f"Recording iteration failed (consecutive failure "
-                        f"{consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})",
-                        exc_info=True,
+                    consecutive_failures = self._handle_recording_failure(
+                        consecutive_failures, "Recording iteration"
                     )
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                        self._fatal_exit()
-                    self._teardown_for_recovery()
                 else:
                     if chunk_path:
                         consecutive_failures = 0
@@ -685,6 +694,25 @@ class VideoRecorder:
         finally:
             self._cleanup(final=True)
     
+    def _handle_recording_failure(self, consecutive_failures: int, context: str) -> int:
+        """Log a recording failure, escalate to a fatal process exit past the
+        threshold, and tear down for a fresh retry. Shared by every recording
+        loop so the counter/backoff/escalation policy lives in one place.
+
+        Must be called from within the except block for the failure so
+        exc_info=True captures it. Returns the updated failure count.
+        """
+        consecutive_failures += 1
+        logger.error(
+            f"{context} failed (consecutive failure "
+            f"{consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})",
+            exc_info=True,
+        )
+        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            self._fatal_exit()
+        self._teardown_for_recovery()
+        return consecutive_failures
+
     def _teardown_for_recovery(self) -> None:
         """Best-effort camera/encoder teardown after a failure. Never raises.
 
