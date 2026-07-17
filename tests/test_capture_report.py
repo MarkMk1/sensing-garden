@@ -7,12 +7,29 @@ rides the per-device tar next to the results it describes.
 """
 import json
 import queue
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from bugcam.capture_report import CaptureLog
 from bugcam.pollen.pollen import Pollen, PollenConfig
+
+
+class _OneShotEvent(threading.Event):
+    """wait() returns False exactly once (letting one loop iteration run),
+    then behaves like a normal already-set event."""
+
+    def __init__(self):
+        super().__init__()
+        self._waited = False
+
+    def wait(self, timeout=None):
+        if not self._waited:
+            self._waited = True
+            return False
+        self.set()
+        return True
 
 
 def _clock(*stamps: datetime):
@@ -247,6 +264,27 @@ class TestCaptureReportLoop:
         _capture_report_loop(CaptureLog(captures, "flick1"), "flick1", stop, BrokenPollen(), interval=0.01)
 
         assert leftover.exists()  # kept for the next recovery pass
+
+    def test_loop_ticks_rotate_and_ships_on_the_timer(self, tmp_path):
+        """The loop's core job -- rotate() and ship on a timer -- was
+        untested: both tests above pre-set stop before calling, so the loop
+        body (`while not stop_event.wait(interval): _ship(capture_log.rotate())`)
+        never ran; only the startup recover() path was covered."""
+        from bugcam.commands.run import _capture_report_loop
+
+        log = CaptureLog(tmp_path / "captures", "flick1", clock=_clock(_dt(10), _dt(11)))
+
+        shipped = []
+
+        class FakePollen:
+            def enqueue_set(self, files, *, device, kind):
+                shipped.append((files[0].name, device, kind))
+                return [1]
+
+        stop = _OneShotEvent()
+        _capture_report_loop(log, "flick1", stop, FakePollen(), interval=0.01)
+
+        assert shipped == [("20260714_110000.json", "flick1", "capture")]
 
 
 class TestRecorderNotifiesChunkComplete:
