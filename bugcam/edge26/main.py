@@ -741,6 +741,11 @@ class Pipeline:
                 # compact YYYYMMDD_HHMMSS_micros video stem (matches processor.py),
                 # stamped in UTC by the recorder, so carry the +00:00 offset.
                 video_timestamp_iso = video_stem_utc_iso(date_time)
+                if video_timestamp_iso is None:
+                    logger.warning(
+                        f"Video stem {date_time!r} did not parse as YYYYMMDD_HHMMSS; "
+                        f"shipping video_timestamp: null for {video_path.name}"
+                    )
                 detection_meta = {
                     "source_device": self.flick_id,
                     "date": date_time[:8],
