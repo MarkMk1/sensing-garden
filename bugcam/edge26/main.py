@@ -18,7 +18,7 @@ from bugcam.edge26.metrics import PipelineMetrics
 from bugcam.edge26.queue import ClassificationQueue, QueueEntry
 from bugcam.edge26.result_health import audit_result_dir
 from bugcam.log_shipping import DailyLogHandler, ship_existing_logs
-from bugcam.record_window import RecordingWindow, local_video_date, video_stem_utc_iso
+from bugcam.record_window import RecordingWindow, local_video_date, resolve_zone, video_stem_utc_iso
 from bugcam.capture_report import CAPTURES_SUBDIR
 
 # Producer-owned utility dirs under a device dir, not per-timestamp result
@@ -158,9 +158,8 @@ class Pipeline:
         self._local_zone = None
         if self.timezone_name:
             try:
-                from zoneinfo import ZoneInfo
-                self._local_zone = ZoneInfo(self.timezone_name)
-            except Exception:
+                self._local_zone = resolve_zone(self.timezone_name)
+            except ValueError:
                 logger.error(
                     f"Unknown timezone {self.timezone_name!r}; "
                     "day boundaries fall back to UTC and no recording window applies"
