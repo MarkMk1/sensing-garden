@@ -11,6 +11,8 @@ import re
 from datetime import datetime, time as dtime, timezone, tzinfo
 from zoneinfo import ZoneInfo
 
+from tzlocal import get_localzone
+
 logger = logging.getLogger(__name__)
 
 # Applied when a timezone is configured but no explicit window is set:
@@ -22,10 +24,16 @@ _WINDOW_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$")
 
 
 def resolve_zone(timezone_name: str | None) -> tzinfo:
-    """Resolve an IANA timezone name, or the system-local zone when unset."""
+    """Resolve an IANA timezone name, or the system-local zone when unset.
+
+    The unconfigured fallback is a real (DST-aware) IANA zone via tzlocal,
+    not a fixed UTC offset snapshotted at call time -- this object is cached
+    for the life of a daemon that runs for weeks, so it must keep tracking
+    DST on its own rather than freezing whatever offset was current at
+    process start.
+    """
     if not timezone_name:
-        local = datetime.now(timezone.utc).astimezone().tzinfo
-        return local if local is not None else timezone.utc
+        return get_localzone()
     try:
         return ZoneInfo(timezone_name)
     except Exception as exc:

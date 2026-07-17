@@ -58,6 +58,35 @@ def test_from_config_window_without_timezone_uses_system_local() -> None:
     assert window.is_open(datetime.now(timezone.utc)) in (True, False)
 
 
+# --- resolve_zone: the unconfigured (system-local) fallback ---
+
+def test_resolve_zone_unconfigured_delegates_to_tzlocal(monkeypatch) -> None:
+    """Pin the actual fix: resolve_zone(None) must return tzlocal's
+    DST-aware local zone, not a fixed offset snapshotted at call time."""
+    from bugcam import record_window
+
+    sentinel = ZoneInfo("Europe/Amsterdam")
+    monkeypatch.setattr(record_window, "get_localzone", lambda: sentinel)
+
+    assert record_window.resolve_zone(None) is sentinel
+
+
+def test_resolve_zone_unconfigured_is_dst_aware(monkeypatch) -> None:
+    """Before this fix, resolve_zone(None) snapshotted a fixed UTC offset at
+    call time (datetime.now().astimezone().tzinfo) -- correct only until the
+    next DST transition, then wrong by an hour for the rest of the daemon's
+    (weeks-long) run. The returned zone must instead recompute its offset
+    per-instant, like a real IANA zone."""
+    from bugcam import record_window
+
+    monkeypatch.setattr(record_window, "get_localzone", lambda: ZoneInfo("Europe/Amsterdam"))
+
+    zone = record_window.resolve_zone(None)
+    winter = datetime(2026, 1, 15, tzinfo=timezone.utc)
+    summer = datetime(2026, 7, 15, tzinfo=timezone.utc)
+    assert zone.utcoffset(winter) != zone.utcoffset(summer)
+
+
 # --- is_open: wall-clock semantics in the configured zone ---
 
 def test_window_boundaries_in_london_summer() -> None:
