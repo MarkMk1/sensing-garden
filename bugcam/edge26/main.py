@@ -19,11 +19,12 @@ from bugcam.edge26.queue import ClassificationQueue, QueueEntry
 from bugcam.edge26.result_health import audit_result_dir
 from bugcam.log_shipping import DailyLogHandler, ship_existing_logs
 from bugcam.record_window import RecordingWindow, local_video_date, video_stem_utc_iso
+from bugcam.capture_report import CAPTURES_SUBDIR
 
 # Producer-owned utility dirs under a device dir, not per-timestamp result
 # directories -- the sweep and inventory must never treat them as results
 # (rmtree'ing one races its live writer, e.g. the heartbeat loop).
-NON_RESULT_SUBDIRS = {"heartbeats", "environment", "logs", "captures"}
+NON_RESULT_SUBDIRS = {"heartbeats", "environment", "logs", CAPTURES_SUBDIR}
 
 
 def setup_logging(log_dir: Path, *, on_log_complete=None) -> None:
