@@ -100,6 +100,57 @@ class TestCaptureLogRotate:
         assert report["sample_count"] == 1
 
 
+class TestCaptureLogLockContention:
+    def test_record_chunk_does_not_block_on_rotates_slow_report_write(self, tmp_path):
+        """rotate() used to hold one lock across a read, a report write, and an
+        unlink -- if a chunk finished mid-rotate, the recorder thread's
+        record_chunk() would block on that I/O before it could start the next
+        chunk, undermining the "no gaps" continuous-recording guarantee. Only
+        the rename that swaps current.jsonl out needs the lock; the slow part
+        must run outside it."""
+        import threading
+
+        log = CaptureLog(tmp_path / "captures", "edge26", clock=_clock(_dt(10), _dt(11)))
+        log.record_chunk(_chunk(tmp_path, "a.mp4"), 60.0)
+
+        write_started = threading.Event()
+        release_write = threading.Event()
+        original_write_report = log._write_report
+
+        def slow_write_report(*args, **kwargs):
+            write_started.set()
+            assert release_write.wait(timeout=5), "test deadlocked"
+            return original_write_report(*args, **kwargs)
+
+        log._write_report = slow_write_report
+
+        rotate_thread = threading.Thread(target=log.rotate)
+        rotate_thread.start()
+        try:
+            assert write_started.wait(timeout=5), "rotate() never reached the slow report write"
+            # The lock must already be released at this point: record_chunk()
+            # should complete immediately, not wait for rotate() to finish.
+            done = threading.Event()
+
+            def do_record():
+                log.record_chunk(_chunk(tmp_path, "b.mp4"), 5.0)
+                done.set()
+
+            recorder_thread = threading.Thread(target=do_record)
+            recorder_thread.start()
+            recorder_thread.join(timeout=1.0)
+            assert done.is_set(), "record_chunk() blocked on rotate()'s slow report write"
+        finally:
+            release_write.set()
+            rotate_thread.join(timeout=5)
+
+        # b.mp4's chunk landed in the fresh (post-rotate) current.jsonl, not
+        # folded into the report that was still being written when it recorded.
+        lines = (tmp_path / "captures" / "current.jsonl").read_text().splitlines()
+        assert len(lines) == 1
+        assert json.loads(lines[0])["video_file"] == "b.mp4"
+
+
 class TestCaptureLogRecover:
     def test_recover_seals_leftover_current_and_lists_unshipped(self, tmp_path):
         captures = tmp_path / "captures"

@@ -26,8 +26,11 @@ DEFAULT_REPORT_INTERVAL_SECONDS = 3600.0  # matches the default --upload-poll ca
 class CaptureLog:
     """Durable per-chunk sampling log with periodic report sealing.
 
-    record_chunk() is called from the recorder thread; rotate()/recover() from the
-    report loop -- a lock serialises them around the shared current.jsonl file."""
+    record_chunk() is called from the recorder thread; rotate()/recover() from
+    the report loop. The lock only ever guards a rename of current.jsonl (an
+    atomic swap-out, near-instant); the slower read/write-report/unlink work
+    runs outside it so a rotation in progress never blocks the recorder
+    thread's next append."""
 
     def __init__(
         self,
@@ -70,13 +73,23 @@ class CaptureLog:
 
     def rotate(self) -> Path:
         """Seal the current period into a report (written even when empty: a
-        zero-sample period is a signal, not silence) and start the next one."""
+        zero-sample period is a signal, not silence) and start the next one.
+
+        Only the rename that swaps current.jsonl out happens under the lock
+        (a single near-instant syscall); the read/write-report work that
+        follows runs outside it, so record_chunk() from the recorder thread
+        is never blocked on rotate()'s I/O.
+        """
         with self._lock:
-            samples = self._read_samples()
+            period_start = self._period_start
             period_end = self._clock()
-            report_path = self._write_report(samples, self._period_start, period_end)
-            self._current_path.unlink(missing_ok=True)
+            rotated_path = self._swap_current_path(period_end)
             self._period_start = period_end
+
+        samples = self._read_samples(rotated_path) if rotated_path else []
+        report_path = self._write_report(samples, period_start, period_end)
+        if rotated_path is not None:
+            rotated_path.unlink(missing_ok=True)
         return report_path
 
     def recover(self) -> list[Path]:
@@ -84,7 +97,10 @@ class CaptureLog:
         bounds from its sample timestamps) and return every unshipped report,
         oldest first, for the caller to enqueue."""
         with self._lock:
-            samples = self._read_samples()
+            rotated_path = self._swap_current_path(self._clock())
+
+        if rotated_path is not None:
+            samples = self._read_samples(rotated_path)
             if samples:
                 stamps = []
                 for sample in samples:
@@ -95,14 +111,30 @@ class CaptureLog:
                 start = min(stamps) if stamps else self._clock()
                 end = max(stamps) if stamps else self._clock()
                 self._write_report(samples, start, end)
-            self._current_path.unlink(missing_ok=True)
-            if not self.captures_dir.is_dir():
-                return []
-            return sorted(p for p in self.captures_dir.glob("*.json") if p.is_file())
+            rotated_path.unlink(missing_ok=True)
 
-    def _read_samples(self) -> list[dict]:
+        if not self.captures_dir.is_dir():
+            return []
+        return sorted(p for p in self.captures_dir.glob("*.json") if p.is_file())
+
+    def _swap_current_path(self, moment: datetime) -> Optional[Path]:
+        """Atomically rename current.jsonl out from under record_chunk() --
+        which lazily recreates it fresh on its next append, same as it always
+        has -- so the caller can process the old file's contents at leisure
+        without holding the lock. Returns None if there was nothing to swap."""
+        if not self._current_path.exists():
+            return None
+        rotated_path = self.captures_dir / f".rotating-{moment.strftime('%Y%m%d_%H%M%S_%f')}.jsonl"
         try:
-            text = self._current_path.read_text(encoding="utf-8")
+            self._current_path.rename(rotated_path)
+        except FileNotFoundError:
+            return None
+        return rotated_path
+
+    def _read_samples(self, path: Optional[Path] = None) -> list[dict]:
+        path = path or self._current_path
+        try:
+            text = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return []
         samples = []
@@ -113,7 +145,7 @@ class CaptureLog:
             try:
                 samples.append(json.loads(line))
             except json.JSONDecodeError:
-                logger.warning("capture log: skipping corrupt line in %s", self._current_path)
+                logger.warning("capture log: skipping corrupt line in %s", path)
         return samples
 
     def _write_report(self, samples: list[dict], period_start: datetime, period_end: datetime) -> Path:
