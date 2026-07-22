@@ -337,6 +337,38 @@ class HailoClassifier:
         self.species_to_genus = taxonomy[3]
         self.genus_to_family = taxonomy[2]
 
+        self._validate_label_dimensions()
+
+    def _validate_label_dimensions(self) -> None:
+        """labels.txt and model.hef are independently-versioned files that only
+        happen to sit in the same bundle directory -- nothing upstream checks
+        they're actually compatible. Without this, a mismatch surfaces as an
+        IndexError deep inside inference, on whichever track happens to hit a
+        class near the tail of the list."""
+        output_infos = self._hef.get_output_vstream_infos()
+        if len(output_infos) >= 3:
+            heads = [
+                ("family", self.family_list, output_infos[0]),
+                ("genus", self.genus_list, output_infos[1]),
+                ("species", self.species_list, output_infos[2]),
+            ]
+        else:
+            heads = [("species", self.species_list, output_infos[0])]
+
+        mismatches = [
+            f"{head_name}: {len(labels)} labels vs. model outputs {info.shape[-1]}"
+            for head_name, labels, info in heads
+            if len(labels) != info.shape[-1]
+        ]
+        if mismatches:
+            raise ValueError(
+                f"Model/label dimension mismatch for {self.model_path}: "
+                + "; ".join(mismatches)
+                + ". labels.txt and model.hef were not exported from the same "
+                "training run -- check the bundle's provenance (model_sha256/"
+                "labels_sha256) against what's actually installed."
+            )
+
     def _load_labels_fallback(self) -> None:
         """Generate numeric placeholder labels from the model output shapes."""
         output_infos = self._hef.get_output_vstream_infos()
