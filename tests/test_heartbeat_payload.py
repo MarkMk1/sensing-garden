@@ -1,5 +1,8 @@
 """Heartbeat payload: incoming-directory backlog plus optional pipeline/upload
 sections supplied by `bugcam run`."""
+from datetime import datetime
+from os import utime as os_utime
+
 import pytest
 
 from bugcam.commands import heartbeat as hb
@@ -51,6 +54,79 @@ class TestIncoming:
             "dot_dirs": 0,
             "ready_dot_tracks": 0,
         }
+
+
+class TestDotStatus:
+    """_build_dot_status must reflect ongoing track activity, not just when the
+    dot's directory was first created. The receiver only ever writes into
+    <dot>_<date>/crops/<track>/... and <dot>_<date>/labels/<id>.json -- never
+    directly into <dot>_<date>/ itself after its first track of the day -- so
+    the top-level directory's own mtime freezes at that first-track moment and
+    never reflects anything that happens afterward."""
+
+    def _touch_dir(self, path, mtime):
+        path.mkdir(parents=True, exist_ok=True)
+        os_utime(path, (mtime, mtime))
+
+    def test_reports_latest_crops_track_not_directory_creation_time(self, tmp_path):
+        import time
+        dot_dir = tmp_path / "dot01_20260714"
+        early = time.time() - 3600
+        late = time.time() - 60
+        track_a = dot_dir / "crops" / "track-a_120000"
+        track_b = dot_dir / "crops" / "track-b_125900"
+        track_a.mkdir(parents=True)
+        track_b.mkdir(parents=True)
+        # Building the tree bumps every ancestor's mtime to "now" as a side
+        # effect of each new entry; only after it's fully built do we set the
+        # exact mtimes we want to assert against (utime doesn't propagate
+        # upward the way a real create/write does, so order here doesn't
+        # matter beyond "after the tree exists").
+        os_utime(track_a, (early, early))
+        os_utime(track_b, (late, late))
+        os_utime(dot_dir / "crops", (late, late))
+        os_utime(dot_dir, (early, early))
+
+        status = _payload(tmp_path)["dot_status"]
+
+        (dot01,) = [d for d in status if d["dot_id"] == "dot01"]
+        reported = datetime.fromisoformat(dot01["last_modified"]).timestamp()
+        assert reported == pytest.approx(late, abs=2)
+
+    def test_reports_latest_labels_write_too(self, tmp_path):
+        import time
+        dot_dir = tmp_path / "dot01_20260714"
+        early = time.time() - 3600
+        late = time.time() - 30
+        labels_file = dot_dir / "labels" / "track-a.json"
+        labels_file.parent.mkdir(parents=True)
+        labels_file.write_text("{}")
+        os_utime(labels_file, (late, late))
+        os_utime(dot_dir / "labels", (late, late))
+        os_utime(dot_dir, (early, early))
+
+        status = _payload(tmp_path)["dot_status"]
+
+        (dot01,) = [d for d in status if d["dot_id"] == "dot01"]
+        reported = datetime.fromisoformat(dot01["last_modified"]).timestamp()
+        assert reported == pytest.approx(late, abs=2)
+
+    def test_falls_back_to_directory_mtime_when_nothing_written_yet(self, tmp_path):
+        import time
+        dot_dir = tmp_path / "dot01_20260714"
+        moment = time.time() - 120
+        self._touch_dir(dot_dir, moment)
+
+        status = _payload(tmp_path)["dot_status"]
+
+        (dot01,) = [d for d in status if d["dot_id"] == "dot01"]
+        reported = datetime.fromisoformat(dot01["last_modified"]).timestamp()
+        assert reported == pytest.approx(moment, abs=2)
+
+    def test_no_directory_reports_none(self, tmp_path):
+        status = _payload(tmp_path)["dot_status"]
+        (dot01,) = [d for d in status if d["dot_id"] == "dot01"]
+        assert dot01["last_modified"] is None
 
 
 class TestNetworkUsageReader:

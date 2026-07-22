@@ -56,6 +56,33 @@ def _read_network_usage() -> list[dict[str, object]]:
     return sorted(interfaces, key=lambda entry: entry["interface"])
 
 
+def _dot_directory_last_modified(dot_dir: Path) -> float:
+    """Newest activity under a dot's directory, not just when it was created.
+
+    The receiver (bugcam/receiver/routes.py) never writes directly into
+    <dot>_<date>/ after its first track of the day -- every crop and label
+    write lands one level deeper, in crops/<track>/... or labels/<id>.json.
+    A directory's mtime only moves when an entry is added/removed from it
+    directly, so <dot>_<date>/'s own mtime freezes at whenever "crops" and
+    "labels" were first created and never reflects anything that happens to
+    an existing or later track afterward. Checking one level into each of
+    those (not recursing into every frame file) catches every real write:
+    a new track's folder/label file bumps its parent's mtime, and an
+    existing track's own folder mtime bumps on every new frame added to it."""
+    newest = dot_dir.stat().st_mtime
+    for subdir_name in ("crops", "labels"):
+        subdir = dot_dir / subdir_name
+        if not subdir.is_dir():
+            continue
+        newest = max(newest, subdir.stat().st_mtime)
+        for child in subdir.iterdir():
+            try:
+                newest = max(newest, child.stat().st_mtime)
+            except OSError:
+                continue
+    return newest
+
+
 def _build_dot_status(input_dir: Path, dot_ids: list[str]) -> list[dict[str, str | None]]:
     status = []
     for dot_id in dot_ids:
@@ -64,7 +91,10 @@ def _build_dot_status(input_dir: Path, dot_ids: list[str]) -> list[dict[str, str
         status.append(
             {
                 "dot_id": dot_id,
-                "last_modified": datetime.fromtimestamp(latest_dir.stat().st_mtime, tz=timezone.utc).isoformat() if latest_dir else None,
+                "last_modified": (
+                    datetime.fromtimestamp(_dot_directory_last_modified(latest_dir), tz=timezone.utc).isoformat()
+                    if latest_dir else None
+                ),
             }
         )
     return status
