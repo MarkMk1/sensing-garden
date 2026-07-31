@@ -18,8 +18,6 @@ Architecture (OpenCV fallback):
 
 import cv2
 import os
-import shutil
-import subprocess
 import time
 import queue
 import threading
@@ -29,6 +27,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
+from bugcam.media import check_disk_space, check_ffmpeg_available, remux_to_mp4
 from bugcam.record_window import RecordingWindow
 
 logger = logging.getLogger(__name__)
@@ -310,42 +309,14 @@ class VideoRecorder:
     @staticmethod
     def _check_ffmpeg_available() -> bool:
         """Check if ffmpeg is available on the system."""
-        try:
-            subprocess.run(
-                ["ffmpeg", "-version"],
-                capture_output=True,
-                timeout=5,
-            )
-            return True
-        except Exception:
-            return False
+        return check_ffmpeg_available()
 
     def _remux_chunk(self, src: Path, dst: Path) -> bool:
         """Remux raw H.264 to MP4 container. Returns True on success."""
-        try:
-            result = subprocess.run(
-                [
-                    "ffmpeg", "-y", "-loglevel", "error",
-                    "-i", str(src),
-                    "-c", "copy",
-                    "-r", str(self.fps),
-                    str(dst),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                src.unlink(missing_ok=True)
-                return True
-            logger.error(f"Remux failed: {result.stderr}")
+        if not remux_to_mp4(src, dst, fps=self.fps, timeout=30):
             return False
-        except FileNotFoundError:
-            logger.warning("ffmpeg not found, using raw H.264 file")
-            return False
-        except Exception as e:
-            logger.error(f"Remux error: {e}")
-            return False
+        src.unlink(missing_ok=True)
+        return True
 
     def _record_chunk_hardware(self) -> Optional[Path]:
         """
@@ -358,8 +329,8 @@ class VideoRecorder:
         backoff, re-init) and escalation. Returns None only for benign skips
         (low disk, stop requested before any data was written).
         """
-        free_bytes = shutil.disk_usage(self.output_dir).free
-        if free_bytes < MIN_FREE_DISK_BYTES:
+        has_space, free_bytes = check_disk_space(self.output_dir, MIN_FREE_DISK_BYTES)
+        if not has_space:
             logger.warning(
                 "Skipping chunk because free space is low: %.1fMB available",
                 free_bytes / (1024 * 1024),
@@ -440,8 +411,8 @@ class VideoRecorder:
         Returns:
             Path to the completed chunk, or None if stopped early.
         """
-        free_bytes = shutil.disk_usage(self.output_dir).free
-        if free_bytes < MIN_FREE_DISK_BYTES:
+        has_space, free_bytes = check_disk_space(self.output_dir, MIN_FREE_DISK_BYTES)
+        if not has_space:
             logger.warning(
                 "Skipping chunk because free space is low: %.1fMB available",
                 free_bytes / (1024 * 1024),

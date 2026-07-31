@@ -33,20 +33,6 @@ def test_record_single_requires_linux(cli_runner: CliRunner) -> None:
         assert "Linux" in result.output or "Raspberry Pi" in result.output
 
 
-def test_check_ffmpeg_available() -> None:
-    """Test _check_ffmpeg_available function."""
-    from bugcam.commands.record import _check_ffmpeg_available
-
-    # Mock ffmpeg exists
-    with patch('subprocess.run') as mock_run:
-        mock_run.return_value.returncode = 0
-        assert _check_ffmpeg_available() is True
-
-    # Mock ffmpeg missing
-    with patch('subprocess.run', side_effect=FileNotFoundError()):
-        assert _check_ffmpeg_available() is False
-
-
 def test_remux_video_success(tmp_path: Path) -> None:
     """Test _remux_video succeeds with ffmpeg."""
     from bugcam.commands.record import _remux_video
@@ -54,7 +40,7 @@ def test_remux_video_success(tmp_path: Path) -> None:
     video_path = tmp_path / "test.mp4"
     video_path.write_bytes(b"fake video data")
 
-    with patch('bugcam.commands.record._check_ffmpeg_available', return_value=True), \
+    with patch('bugcam.commands.record.check_ffmpeg_available', return_value=True), \
          patch('subprocess.run') as mock_run, \
          patch('os.replace') as mock_replace:
         mock_run.return_value.returncode = 0
@@ -70,7 +56,7 @@ def test_remux_video_no_ffmpeg(tmp_path: Path) -> None:
     video_path = tmp_path / "test.mp4"
     video_path.write_bytes(b"fake video data")
 
-    with patch('bugcam.commands.record._check_ffmpeg_available', return_value=False):
+    with patch('bugcam.commands.record.check_ffmpeg_available', return_value=False):
         result = _remux_video(video_path)
         assert result is True  # Returns True (no error, just skipped)
 

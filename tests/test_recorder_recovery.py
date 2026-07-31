@@ -311,8 +311,7 @@ def test_skipped_chunk_waits_instead_of_spinning(tmp_path, monkeypatch):
     cameras = install_scripted_camera(rec, [])
     rec.stop_event = _OneShotEvent()
     monkeypatch.setattr(
-        recorder_module.shutil,
-        "disk_usage",
+        "shutil.disk_usage",
         lambda p: SimpleNamespace(total=1, used=1, free=0),
     )
     exit_mock = patched_exit(monkeypatch)

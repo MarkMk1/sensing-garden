@@ -15,6 +15,7 @@ from ..config import (
     parse_dot_ids,
     is_edge26_classification_enabled,
 )
+from ..media import check_camera_available
 from ..model_bundles import get_installed_bundles
 
 app = typer.Typer(help="Check system status and dependencies")
@@ -77,23 +78,7 @@ def _check_hailo_device() -> tuple[bool, str]:
 
 def _check_camera() -> tuple[bool, str]:
     """Test camera connection."""
-    try:
-        result = subprocess.run(
-            ["/usr/bin/python3", "-c", "from picamera2 import Picamera2; Picamera2()"],
-            capture_output=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            return True, "Accessible"
-
-        stderr = result.stderr.decode()
-        if "dtype size changed" in stderr or "binary incompatibility" in stderr:
-            return False, "NumPy incompatibility"
-        return False, "Not accessible"
-    except subprocess.TimeoutExpired:
-        return False, "Timeout"
-    except Exception as e:
-        return False, str(e)[:50]
+    return check_camera_available(timeout=5)
 
 
 def _check_sensor() -> tuple[bool, str]:

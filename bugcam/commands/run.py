@@ -26,15 +26,14 @@ from bugcam.config import (
     load_config,
     parse_dot_ids,
 )
+from bugcam.commands.common import parse_resolution_option
 from bugcam.commands.status import _check_time_sync
 from bugcam.device_config import resolve_flick_id
 from bugcam.environment_sensor import collect_environment_reading
-from bugcam.processing import parse_capture_resolution
 from bugcam.record_window import RecordingWindow
 from bugcam.runtime import build_pipeline, resolve_bundle_provenance, select_model_reference
-from bugcam.receiver import create_app
 from bugcam.receiver.config import RECEIVER_DEFAULT_PORT, RECEIVER_DEFAULT_HOST
-from bugcam.receiver.tracker import PendingTrackTracker
+from bugcam.receiver.service import run_receiver
 
 app = typer.Typer(help="Record, process, upload, and emit heartbeats", invoke_without_command=True, no_args_is_help=False)
 console = Console()
@@ -167,53 +166,6 @@ def _environment_loop(
                 logger.warning("environment sensor/enqueue warning: %s: %s", type(exc).__name__, exc)
                 warning_emitted = True
         stop_event.wait(ENVIRONMENT_INTERVAL_SECONDS)
-
-
-def _receiver_loop(
-    host: str,
-    port: int,
-    stop_event: threading.Event,
-) -> None:
-    """Run the Flask receiver server in a thread."""
-    flask_app = create_app(config={"host": host, "port": port})
-    tracker = flask_app.config.get("TRACKER")
-
-    if tracker:
-        logger.info("Scanning for orphaned tracks...")
-        tracker.recover_orphaned_tracks()
-
-        finalization_stop = threading.Event()
-        finalization_thread = threading.Thread(
-            target=_finalization_loop,
-            args=(tracker, finalization_stop),
-            daemon=True
-        )
-        finalization_thread.start()
-        logger.info("Track finalization thread started for receiver")
-
-    logger.info(f"Receiver starting on {host}:{port}")
-    flask_app.run(host=host, port=port, threaded=True, debug=False)
-
-    if tracker and finalization_thread:
-        finalization_stop.set()
-        finalization_thread.join(timeout=5)
-
-
-def _finalization_loop(tracker: PendingTrackTracker, stop_event: threading.Event):
-    """Background thread that checks for idle tracks to finalize."""
-    while not stop_event.is_set():
-        try:
-            tracker.check_pending()
-        except Exception as e:
-            logger.error(f"Finalization loop error: {e}")
-        stop_event.wait(PendingTrackTracker.CHECK_INTERVAL)
-
-
-def _parse_resolution_option(value: str) -> tuple[int, int]:
-    try:
-        return parse_capture_resolution(value)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
 
 
 def _resolve_runtime_settings(
@@ -425,7 +377,7 @@ def run(
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
-    parsed_resolution = _parse_resolution_option(resolution)
+    parsed_resolution = parse_resolution_option(resolution)
 
     try:
         ntp_ok, ntp_detail = _check_time_sync()
@@ -544,7 +496,6 @@ def run(
         heartbeat_stop_event = threading.Event()
         environment_stop_event = threading.Event()
         capture_report_stop_event = threading.Event()
-        receiver_stop_event = threading.Event()
         heartbeat_thread = threading.Thread(
             target=_heartbeat_loop,
             args=(
@@ -590,8 +541,8 @@ def run(
         receiver_thread = None
         if with_receiver:
             receiver_thread = threading.Thread(
-                target=_receiver_loop,
-                args=(receiver_host, receiver_port, receiver_stop_event),
+                target=run_receiver,
+                args=(receiver_host, receiver_port),
                 daemon=True,
                 name="BugCamReceiver",
             )
@@ -619,8 +570,6 @@ def run(
             environment_stop_event.set()
         if "capture_report_stop_event" in locals():
             capture_report_stop_event.set()
-        if "receiver_stop_event" in locals() and receiver_thread:
-            receiver_stop_event.set()
         if "heartbeat_thread" in locals():
             heartbeat_thread.join(timeout=1)
         if "environment_thread" in locals():

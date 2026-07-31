@@ -5,12 +5,12 @@ import json
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import typer
 from rich.console import Console
 
 from bugcam.config import get_input_storage_dir, get_output_storage_dir, load_config, parse_dot_ids
+from bugcam.device_config import resolve_flick_id
 
 app = typer.Typer(help="Write a heartbeat snapshot", invoke_without_command=True, no_args_is_help=False)
 console = Console()
@@ -159,31 +159,6 @@ def write_heartbeat_snapshot(
     return heartbeat_path
 
 
-def _resolve_runtime_settings(
-    flick_id: str | None,
-    dot_ids: str | None,
-) -> dict[str, Any]:
-    config = load_config()
-    resolved_flick_id = flick_id or str(config.get("flick_id") or config.get("device_id") or "")
-    resolved_dot_ids = parse_dot_ids(dot_ids) if dot_ids is not None else parse_dot_ids(config.get("dot_ids"))
-
-    missing_fields = [
-        field_name
-        for field_name, value in (
-            ("flick_id", resolved_flick_id),
-        )
-        if not value
-    ]
-    if missing_fields:
-        joined = ", ".join(missing_fields)
-        raise typer.BadParameter(f"Missing required config values: {joined}. Run `bugcam setup` or pass CLI flags.")
-
-    return {
-        "flick_id": resolved_flick_id,
-        "dot_ids": resolved_dot_ids,
-    }
-
-
 @app.callback()
 def heartbeat(
     flick_id: str | None = typer.Option(None, "--flick-id", help="FLICK device ID"),
@@ -192,12 +167,13 @@ def heartbeat(
     output_dir: Path = typer.Option(get_output_storage_dir(), "--output-dir", help="Directory for processed output"),
 ) -> None:
     """Write a single heartbeat snapshot."""
-    settings = _resolve_runtime_settings(flick_id, dot_ids)
+    config = load_config()
+    resolved_dot_ids = parse_dot_ids(dot_ids) if dot_ids is not None else parse_dot_ids(config.get("dot_ids"))
     heartbeat_path = write_heartbeat_snapshot(
         output_dir=output_dir,
-        flick_id=settings["flick_id"],
+        flick_id=resolve_flick_id(flick_id),
         input_dir=input_dir,
-        dot_ids=settings["dot_ids"],
-        timezone_name=str(load_config().get("timezone") or "") or None,
+        dot_ids=resolved_dot_ids,
+        timezone_name=str(config.get("timezone") or "") or None,
     )
     console.print(f"[green]Wrote[/green] {heartbeat_path}")

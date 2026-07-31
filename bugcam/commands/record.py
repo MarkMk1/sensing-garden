@@ -2,16 +2,15 @@
 import typer
 import time
 import platform
-import subprocess
 import os
-import shutil
 from pathlib import Path
 from datetime import datetime
 from rich.console import Console
 from typing import Optional
 from ..config import get_input_storage_dir
 from ..device_config import resolve_flick_id
-from ..processing import parse_capture_resolution
+from ..media import check_camera_available, check_disk_space, check_ffmpeg_available, remux_to_mp4
+from .common import parse_resolution_option
 
 app = typer.Typer(help="Record videos from camera")
 console = Console()
@@ -19,78 +18,42 @@ console = Console()
 # Default output directory
 DEFAULT_OUTPUT_DIR = get_input_storage_dir()
 
+MIN_FREE_DISK_MB = 300
+
 
 def _build_recording_path(output_dir: Path, flick_id: str) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return output_dir / f"{flick_id}_{timestamp}.mp4"
 
 
-def _resolve_recording_flick_id(flick_id: Optional[str]) -> str:
-    return resolve_flick_id(flick_id)
-
-
-def _parse_resolution_option(value: str) -> tuple[int, int]:
-    try:
-        return parse_capture_resolution(value)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-
-
-def _check_disk_space(output_dir: Path, min_free_mb: int = 300) -> tuple[bool, int]:
+def _check_disk_space(output_dir: Path, min_free_mb: int = MIN_FREE_DISK_MB) -> tuple[bool, int]:
     """Check if output directory has sufficient free disk space.
 
     Returns tuple of (has_space, free_mb).
     """
-    try:
-        usage = shutil.disk_usage(output_dir)
-        free_mb = usage.free // (1024 * 1024)
-        return free_mb >= min_free_mb, free_mb
-    except Exception:
-        # If we can't check, assume it's OK
-        return True, -1
+    has_space, free_bytes = check_disk_space(output_dir, min_free_mb * 1024 * 1024)
+    return has_space, free_bytes // (1024 * 1024) if free_bytes >= 0 else free_bytes
 
 
 def _check_camera_available() -> bool:
     if platform.system() != "Linux":
         return True  # Can't check on non-Linux
-    try:
-        result = subprocess.run(
-            ["/usr/bin/python3", "-c", "from picamera2 import Picamera2; Picamera2()"],
-            capture_output=True,
-            timeout=10
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-
-def _check_ffmpeg_available() -> bool:
-    try:
-        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
-        return result.returncode == 0
-    except Exception:
-        return False
+    ok, _detail = check_camera_available(timeout=10)
+    return ok
 
 
 def _remux_video(path: Path) -> bool:
-    if not _check_ffmpeg_available():
+    if not check_ffmpeg_available():
         console.print("[yellow]ffmpeg not found, skipping remux[/yellow]")
         return True
 
     tmp_path = path.with_suffix('.tmp.mp4')
-    try:
-        subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-i", str(path), "-c", "copy", str(tmp_path)],
-            check=True,
-            capture_output=True
-        )
+    if remux_to_mp4(path, tmp_path):
         os.replace(tmp_path, path)
         return True
-    except Exception as e:
-        console.print(f"[yellow]Remux failed: {e}[/yellow]")
-        if tmp_path.exists():
-            tmp_path.unlink()
-        return False
+    console.print("[yellow]Remux failed[/yellow]")
+    tmp_path.unlink(missing_ok=True)
+    return False
 
 
 def _record_single_video(output_path: Path, length: int, quiet: bool, resolution: tuple[int, int]) -> bool:
@@ -156,8 +119,8 @@ def single(
     if not _check_camera_available():
         console.print("[red]Camera not accessible[/red]")
         raise typer.Exit(1)
-    parsed_resolution = _parse_resolution_option(resolution)
-    resolved_flick_id = _resolve_recording_flick_id(flick_id)
+    parsed_resolution = parse_resolution_option(resolution)
+    resolved_flick_id = resolve_flick_id(flick_id)
 
     # Generate output path if not specified
     if output is None:
@@ -169,7 +132,7 @@ def single(
     # Check disk space before recording
     has_space, free_mb = _check_disk_space(output.parent)
     if not has_space:
-        console.print(f"[red]Insufficient disk space. Need at least 300MB free, have {free_mb}MB.[/red]")
+        console.print(f"[red]Insufficient disk space. Need at least {MIN_FREE_DISK_MB}MB free, have {free_mb}MB.[/red]")
         raise typer.Exit(1)
 
     console.print(f"[cyan]Recording {length}s video to {output}[/cyan]")
